@@ -1,0 +1,721 @@
+/*
+	XMBIH (XrossMediaBar� Item Hider)
+	Copyright (C) 2011, Bubbletune
+	Copyright (C) 2011, Total_Noob
+	Copyright (C) 2008-2011, CompuPhase
+	Copyright (C) 2011, Frostegater
+	Copyright (C) 2011, codestation
+	Copyright (C) 2011, zer01ne
+	
+	main.c: XMBIH main code
+	
+	This program is free software: you can redistribute it and/or modify
+	it under the terms of the GNU General Public License as published by
+	the Free Software Foundation, either version 3 of the License, or
+	(at your option) any later version.
+
+	This program is distributed in the hope that it will be useful,
+	but WITHOUT ANY WARRANTY; without even the implied warranty of
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+	GNU General Public License for more details.
+
+	You should have received a copy of the GNU General Public License
+	along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/*
+	WARNING: For updating plugin on new core change patch[0] and patch[1].
+	Dessasembly vshmain.prx by prxtool (DISASM_w) and stydy ASM code.
+*/
+
+#include <pspsdk.h>
+#include <pspkernel.h>
+#include <systemctrl.h>
+#include <main.h>
+#include <kubridge.h>
+#include <string.h>
+#include <stdarg.h>
+#include "logger.h"
+#include "minGlue.h"
+#include "minIni.h"
+
+PSP_MODULE_INFO("XMBIH", 0x0007, 1, 3);
+
+#define XMBIH_LOG_MAX_ITEMS 200
+
+static int xlog_item_count = 0;
+static struct {
+	volatile unsigned char guard[0x200];
+	volatile unsigned char flags[56];
+} cfg_store;
+
+#define set cfg_store.flags
+
+/*
+ * Hand-rolled libc replacements. Linking against newlib's libc.a on a
+ * user-mode plugin pulls in __retarget_lock_*, _ctype_, _sbrk, etc., which
+ * cascade into Kernel_Library / ThreadManForUser / sceNetInet imports that
+ * the PSP module loader rejects. So we provide the few string helpers we
+ * need, and link with -nodefaultlibs (no -lc).
+ */
+int strcmp(const char *a, const char *b)
+{
+	while (*a && *a == *b) { a++; b++; }
+	return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+char *strcpy(char *d, const char *s)
+{
+	char *r = d;
+	while ((*d++ = *s++)) ;
+	return r;
+}
+
+unsigned int strlen(const char *s)
+{
+	const char *p = s;
+	while (*p) p++;
+	return (unsigned int)(p - s);
+}
+
+char *strrchr(const char *s, int c)
+{
+	const char *last = NULL;
+	for (; *s; s++) if (*s == (char)c) last = s;
+	if ((char)c == 0) return (char *)s;
+	return (char *)last;
+}
+
+char *strncpy(char *d, const char *s, unsigned int n)
+{
+	char *r = d;
+	while (n && *s) {
+		*d++ = *s++;
+		n--;
+	}
+	while (n) {
+		*d++ = 0;
+		n--;
+	}
+	return r;
+}
+
+char *strchr(const char *s, int c)
+{
+	for (; *s; s++) if (*s == (char)c) return (char *)s;
+	if ((char)c == 0) return (char *)s;
+	return NULL;
+}
+
+void *memset(void *dst, int v, unsigned int n)
+{
+	unsigned char *p = (unsigned char *)dst;
+	while (n--) *p++ = (unsigned char)v;
+	return dst;
+}
+
+void *memcpy(void *dst, const void *src, unsigned int n)
+{
+	unsigned char *d = (unsigned char *)dst;
+	const unsigned char *s = (const unsigned char *)src;
+	while (n--) *d++ = *s++;
+	return dst;
+}
+
+long strtol(const char *s, char **end, int base)
+{
+	long v = 0;
+	int neg = 0;
+	while (*s == ' ' || *s == '\t') s++;
+	if (*s == '+') s++;
+	else if (*s == '-') { neg = 1; s++; }
+	if (base == 0) {
+		if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+		else if (*s == '0') { base = 8; s++; }
+		else base = 10;
+	} else if (base == 16 && *s == '0' && (s[1] == 'x' || s[1] == 'X')) {
+		s += 2;
+	}
+	while (*s) {
+		int d;
+		if (*s >= '0' && *s <= '9') d = *s - '0';
+		else if (*s >= 'a' && *s <= 'z') d = *s - 'a' + 10;
+		else if (*s >= 'A' && *s <= 'Z') d = *s - 'A' + 10;
+		else break;
+		if (d >= base) break;
+		v = v * base + d;
+		s++;
+	}
+	if (end) *end = (char *)s;
+	return neg ? -v : v;
+}
+
+/*
+ * Hand-rolled logger. NO newlib functions (no vsnprintf / sprintf / stdio):
+ * those drag in Kernel_Library / ThreadManForUser / sceNetInet imports that
+ * cause the PSP module loader to silently reject a user-mode PRX.
+ *
+ * va_list / va_arg are compiler builtins, not libc.
+ */
+
+static int xstrlen(const char *s)
+{
+	int n = 0;
+	while (s[n]) n++;
+	return n;
+}
+
+static void xwrite(const char *path, const char *buf, int len)
+{
+	SceUID fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+	if (fd >= 0) {
+		sceIoWrite(fd, buf, len);
+		sceIoClose(fd);
+	}
+}
+
+/* Bootstrap: writes to fixed paths with no dependency on xlog_path being set. */
+static void xlog_raw_both(const char *msg)
+{
+	int len = xstrlen(msg);
+	xwrite("ef0:/xmbih.log", msg, len);
+	xwrite("ms0:/xmbih.log", msg, len);
+}
+
+/* Formatter — supports %s, %d, %x/%X with optional 0-padded width like %08X. */
+static int xfmt(char *buf, int cap, const char *fmt, va_list ap)
+{
+	int p = 0;
+	for (int i = 0; fmt[i] && p < cap - 1; i++) {
+		if (fmt[i] != '%') { buf[p++] = fmt[i]; continue; }
+		i++;
+		/* Optional 0-prefix and width digits, e.g. %08X */
+		int pad_zero = 0;
+		int width = 0;
+		if (fmt[i] == '0') { pad_zero = 1; i++; }
+		while (fmt[i] >= '0' && fmt[i] <= '9') { width = width * 10 + (fmt[i] - '0'); i++; }
+		switch (fmt[i]) {
+			case 's': {
+				const char *s = va_arg(ap, const char *);
+				if (!s) s = "(null)";
+				while (*s && p < cap - 1) buf[p++] = *s++;
+				break;
+			}
+			case 'd': {
+				int v = va_arg(ap, int);
+				if (v < 0) { if (p < cap - 1) buf[p++] = '-'; v = -v; }
+				char num[16]; int n = 0;
+				if (v == 0) num[n++] = '0';
+				else while (v && n < 16) { num[n++] = '0' + (v % 10); v /= 10; }
+				while (n < width && n < 16) num[n++] = pad_zero ? '0' : ' ';
+				while (n-- > 0 && p < cap - 1) buf[p++] = num[n];
+				break;
+			}
+			case 'X': case 'x': {
+				unsigned int v = va_arg(ap, unsigned int);
+				const char *hex = "0123456789ABCDEF";
+				char num[16]; int n = 0;
+				if (v == 0) num[n++] = '0';
+				else while (v && n < 16) { num[n++] = hex[v & 0xF]; v >>= 4; }
+				while (n < width && n < 16) num[n++] = pad_zero ? '0' : ' ';
+				while (n-- > 0 && p < cap - 1) buf[p++] = num[n];
+				break;
+			}
+			case '%': if (p < cap - 1) buf[p++] = '%'; break;
+			default: if (p < cap - 1) buf[p++] = fmt[i]; break;
+		}
+	}
+	return p;
+}
+
+static void xlog(const char *fmt, ...)
+{
+	char buf[256];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = xfmt(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (n <= 0) return;
+	xwrite("ef0:/xmbih.log", buf, n);
+	xwrite("ms0:/xmbih.log", buf, n);
+}
+
+int (* AddVshItem)(void *a0, int topitem, SceVshItem *item);
+int (* umdIoOpen)(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode);
+
+STMOD_HANDLER previous;
+
+char *global_category = "Global";
+char *settings_category = "Settings";
+char *extras_category = "Extras";
+char *photo_category = "Photo";
+char *music_category = "Music";
+char *video_category = "Video";
+char *game_category = "Game";
+char *network_category = "Network";
+char *playstation_network_category = "PlayStation\xAENetwork";
+
+void ClearCaches()
+{
+	sceKernelDcacheWritebackAll();
+	kuKernelIcacheInvalidateAll();
+}
+
+int cfg(char *category, char *fmt)
+{
+	return ini_getlhex(category, fmt, 0, ini_path);
+}
+
+int skip(SceVshItem *item, int location)
+{
+	int idnm(char *name)
+	{
+		return strcmp(item->text, name);
+	}
+
+	if (!idnm("msg_signup") || !idnm("msg_ps_store") || !idnm("msg_information_board")) {
+		xlog("psn state: text='%s' loc=%d s6=%d s51=%d s52=%d s53=%d s54=%d\n",
+			item->text, location, set[6], set[51], set[52], set[53], set[54]);
+	}
+
+	if (!idnm("msg_game_hibernation")) {
+		xlog("hibernation state: loc=%d s38=%d s4=%d s54=%d\n",
+			location, set[38], set[4], set[54]);
+	}
+
+	if((!(
+	((devkit >= FW(0x620) ? !idnm("msg_system_update") : !idnm("msgtop_sysconf_update")) && (set[7] || set[0])) ||
+	(!idnm("msgtop_sysconf_usb") && (set[8] || set[0])) ||
+	(!idnm("msgtop_sysconf_video") && (set[9] || set[0])) ||
+	(!idnm("msgtop_sysconf_photo") && (set[10] || set[0])) ||
+	(!idnm("msgtop_sysconf_console") && (set[11] || set[0])) ||
+	(!idnm("msgtop_sysconf_theme") && (set[12] || set[0])) ||
+	(!idnm("msgtop_sysconf_date") && (set[13] || set[0])) ||
+	(!idnm("msgtop_sysconf_powersave") && (set[14] || set[0])) ||
+	(!idnm("msg_bt_device_settings") && (set[15] || set[0])) ||
+	(!idnm("msg_display_setting") && (set[16] || set[0])) ||
+	(!idnm("msgtop_sysconf_sound") && (set[17] || set[0])) ||
+	(!idnm("msgtop_sysconf_security") && (set[18] || set[0])) ||
+	(!idnm("msgtop_sysconf_rss") && (set[19] || set[0])) ||
+	(!idnm("msgtop_sysconf_network") && (set[20] || set[0])) ||
+	(!idnm("msg_1seg") && (set[21] || set[1])) ||
+	(!idnm("msg_tdmb") && (set[22] || set[1])) ||
+	(!idnm("msg_bookreader") && (set[23] || set[1])) ||
+	(!idnm("msg_digitalcomics") && (set[24] || set[1])) ||
+	(!idnm("msg_music_unlimited") && (set[25] || set[1])) ||
+	(!idnm("msg_xradar_portable") && (set[26] || set[1])) ||
+	(!idnm("msgtop_camera") && (set[27] || set[2])) ||
+	(!idnm("msgshare_ms") && (set[28] || set[2]) && location == 1) ||
+	(!idnm("msg_em") && (set[29] || set[2]) && location == 1) ||
+	(!idnm("msg_sensme_channels") && (set[30] || set[3])) ||
+	(!idnm("msgshare_ms") && (set[31] || set[3]) && location == 2) ||
+	(!idnm("msg_em") && (set[32] || set[3]) && location == 2) ||
+	(!idnm("msgshare_ms") && set[33] && location == 3) ||
+	(!idnm("msg_em") && set[34] && location == 3) ||
+	(!idnm("msgtop_game_gamedl") && (set[35] || set[4])) ||
+	(!idnm("msgtop_game_savedata") && (set[36] || set[4]) && (psp_model == 4 ? location == 5 : location == 0)) ||
+	(!idnm("msgtop_game_savedata") && (set[37] || set[4]) && psp_model == 4 && location == 6) ||
+	(!idnm("msg_game_hibernation") && (set[38] || set[4])) ||
+	(!idnm("msgshare_ms") && (set[39] || set[4]) && location == 4) ||
+	(!idnm("msg_em") && (set[40] || set[4]) && location == 4) ||
+	(!idnm("msg_onlinemanual") && (set[41] || set[5])) ||
+	(!idnm("msgtop_network_lftv") && (set[42] || set[5])) ||
+	(!idnm("msg_skype") && (set[43] || set[5])) ||
+	(!idnm("msg_ps3_connection") && (set[44] || set[5])) ||
+	(!idnm("msg_internetradio") && (set[45] || set[5])) ||
+	(!idnm("msgtop_network_rss") && (set[46] || set[5])) ||
+	(!idnm("msgtop_network_browser") && (set[47] || set[5])) ||
+	(!idnm("msg_internet_search") && (set[48] || set[5])) ||
+	(!idnm("msg_psspot") && (set[49] || set[5])) ||
+	(!idnm("msg_gomessenger") && (set[50] || set[5])) ||
+	((!idnm("msg_signup") || !idnm("msg_account_manage")) && (set[51] || set[6])) ||
+	(!idnm("msg_ps_store") && (set[52] || set[6])) ||
+	(!idnm("msg_information_board") && (set[53] || set[6]))
+	)) && !set[54])
+		return 1;
+		
+	return 0;
+}
+
+static int xlog_hook(int loc, SceVshItem *item)
+{
+	int show = skip(item, loc);
+	if (xlog_item_count < XMBIH_LOG_MAX_ITEMS) {
+		xlog_item_count++;
+		xlog("hook loc=%d text='%s' show=%d\n", loc, item->text, show);
+	}
+	return show;
+}
+
+int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
+{
+	if(xlog_hook(0, item))
+		AddVshItem(a0, topitem, item);
+
+	return 0;
+}
+
+int AddVshItemPatchedPhoto(void *a0, int topitem, SceVshItem *item)
+{
+	if(xlog_hook(1, item))
+		AddVshItem(a0, topitem, item);
+
+	return 0;
+}
+
+int AddVshItemPatchedMusic(void *a0, int topitem, SceVshItem *item)
+{
+	if(xlog_hook(2, item))
+		AddVshItem(a0, topitem, item);
+
+	return 0;
+}
+
+int AddVshItemPatchedVideo(void *a0, int topitem, SceVshItem *item)
+{
+	if(xlog_hook(3, item))
+		AddVshItem(a0, topitem, item);
+
+	return 0;
+}
+
+int AddVshItemPatchedGame(void *a0, int topitem, SceVshItem *item)
+{
+	if(xlog_hook(4, item))
+		AddVshItem(a0, topitem, item);
+
+	return 0;
+}
+
+int AddVshItemPatchedGameSavedataMs(void *a0, int topitem, SceVshItem *item)
+{
+	if(xlog_hook(5, item))
+		AddVshItem(a0, topitem, item);
+
+	return 0;
+}
+
+int AddVshItemPatchedGameSavedataEf(void *a0, int topitem, SceVshItem *item)
+{
+	if(xlog_hook(6, item))
+		AddVshItem(a0, topitem, item);
+
+	return 0;
+}
+
+void PatchVshMain(u32 text_addr)
+{
+	AddVshItem = (void *)text_addr + patch[0];
+
+	xlog("PatchVshMain: text=0x%08X AddVshItem=0x%08X\n", text_addr, (u32)AddVshItem);
+	xlog("  patch[0]=0x%X first4@AddVshItem=0x%08X\n", patch[0], *(u32 *)AddVshItem);
+	{
+		int i;
+		for (i = 1; i <= 12; i++) {
+			u32 addr = text_addr + patch[i];
+			u32 pre = *(u32 *)addr;
+			xlog("  patch[%d]=0x%X site=0x%08X pre=0x%08X (op=0x%02X)\n",
+				i, patch[i], addr, pre, (pre >> 26) & 0x3F);
+		}
+	}
+
+	/* Permanently items */
+	MAKE_CALL(text_addr + patch[1], AddVshItemPatched);
+	xlog("  patch[1] post=0x%08X\n", *(u32 *)(text_addr + patch[1]));
+
+	/* Photo Memory Stick */
+	MAKE_CALL(text_addr + patch[2], AddVshItemPatchedPhoto);
+
+	/* Music Memory Stick */
+	MAKE_CALL(text_addr + patch[3], AddVshItemPatchedMusic);
+
+	/* Video Memory Stick */
+	MAKE_CALL(text_addr + patch[4], AddVshItemPatchedVideo);
+
+	/* Game Memory Stick */
+	MAKE_CALL(text_addr + patch[5], AddVshItemPatchedGame);
+
+	if(psp_model == 4)
+	{
+		/* Go Game Extra Flash (ef) SaveData */
+		MAKE_CALL(text_addr + patch[6], AddVshItemPatchedGameSavedataMs);
+
+		/* Go Photo Extra Flash (ef) */
+		MAKE_CALL(text_addr + patch[7], AddVshItemPatchedPhoto);
+
+		/* Go Music Extra Flash (ef) */
+		MAKE_CALL(text_addr + patch[8], AddVshItemPatchedMusic);
+
+		/* Go Video Extra Flash (ef) */
+		MAKE_CALL(text_addr + patch[9], AddVshItemPatchedVideo);
+
+		/* Go Game Extra Flash (ef)*/
+		MAKE_CALL(text_addr + patch[10], AddVshItemPatchedGame);
+
+		/* Go Game Memory Stick SaveData */
+		MAKE_CALL(text_addr + patch[11], AddVshItemPatchedGameSavedataEf);
+
+		/* Go Game Resume Game */
+		MAKE_CALL(text_addr + patch[12], AddVshItemPatched);
+	}
+	else
+	{
+		/* Hide UMD Update Icon (from UVMR by TN) */
+		int umdIoOpenPatched(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode)
+		{
+			return (strcmp(file, "/PSP_GAME/SYSDIR/UPDATE/PARAM.SFO") == 0 && 
+			(cfg(game_category, "UMD_UPDATE") || 
+			cfg(global_category, "HIDE_ALL") || set[4])) ? -1 : umdIoOpen(arg, file, flags, mode);;
+		}
+			
+		PspIoDrv* umddrv = sctrlHENFindDriver("isofs");
+		umdIoOpen = umddrv->funcs->IoOpen;
+		umddrv->funcs->IoOpen = umdIoOpenPatched;
+	}
+
+	ClearCaches();
+}
+
+int OnModuleStart(SceModule2 *mod)
+{
+	char *modname = mod->modname;
+	u32 text_addr = mod->text_addr;
+
+	if(strcmp(modname, "vsh_module") == 0) {
+		xlog("OnModuleStart: vsh_module text=0x%08X patching s6=%d s51=%d s52=%d s53=%d s38=%d\n",
+			text_addr, set[6], set[51], set[52], set[53], set[38]);
+		PatchVshMain(text_addr);
+	}
+
+	return previous ? previous(mod) : 0;
+}
+
+int module_start(SceSize args, void *argp)
+{
+	/* Fixed-string raw bootstrap log: writes BEFORE anything that could fault.
+	   Truncates so each boot starts fresh. */
+	{
+		SceUID fd = sceIoOpen("ef0:/xmbih.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+		if (fd >= 0) sceIoClose(fd);
+		fd = sceIoOpen("ms0:/xmbih.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+		if (fd >= 0) sceIoClose(fd);
+	}
+	xlog_raw_both("xmbih: module_start entry\n");
+	if (argp) {
+		xlog_raw_both("xmbih: argp=");
+		xlog_raw_both((const char *)argp);
+		xlog_raw_both("\n");
+	} else {
+		xlog_raw_both("xmbih: argp=NULL\n");
+	}
+
+	xlog_raw_both("ck1: pre-devkit\n");
+	devkit = sceKernelDevkitVersion();
+	xlog_raw_both("ck2: post-devkit\n");
+	psp_model = kuKernelGetModel();
+	xlog_raw_both("ck3: post-kuKernelGetModel\n");
+
+	/* Make ini Path */
+	strcpy(ini_path, argp);
+	strrchr(ini_path, '/')[1] = 0;
+	strcpy(ini_path + strlen(ini_path), "xmbih.ini");
+	xlog_raw_both("ck4: ini_path=");
+	xlog_raw_both(ini_path);
+	xlog_raw_both("\n");
+
+	xlog("xmbih: devkit=0x%X psp_model=%d\n", devkit, psp_model);
+	xlog_raw_both("ck5: post-first-xlog\n");
+
+	xlog_raw_both("cfg: global 0\n");
+	/* Global */
+	set[0] = cfg(global_category, "HIDE_ALL_SETTINGS");
+	set[1] = cfg(global_category, "HIDE_ALL_EXTRAS");
+	set[2] = cfg(global_category, "HIDE_ALL_PHOTO");
+	set[3] = cfg(global_category, "HIDE_ALL_MUSIC");
+	set[4] = cfg(global_category, "HIDE_ALL_GAME");
+	set[5] = cfg(global_category, "HIDE_ALL_NETWORK");
+	set[6] = cfg(global_category, "HIDE_ALL_PSN");	
+	set[54] = cfg(global_category, "HIDE_ALL");
+	set[55] = cfg(global_category, "USE_PLUGIN");
+
+	xlog_raw_both("cfg: settings 1\n");
+	/* Settings */
+	set[7] = cfg(settings_category, "SYSTEM_UPDATE");
+	set[8] = cfg(settings_category, "USB");
+	set[9] = cfg(settings_category, "VIDEO");
+	set[10] = cfg(settings_category, "PHOTO");
+	set[11] = cfg(settings_category, "SYSTEM");
+	set[12] = cfg(settings_category, "THEME");
+	set[13] = cfg(settings_category, "DATE");
+	set[14] = cfg(settings_category, "POWERSAVE");
+	set[15] = cfg(settings_category, "BLUETOOTH");
+	set[16] = cfg(settings_category, "DISPLAY");
+	set[17] = cfg(settings_category, "SOUND");
+	set[18] = cfg(settings_category, "SECURITY");
+	set[19] = cfg(settings_category, "RSS");
+	set[20] = cfg(settings_category, "NETWORK");
+
+	xlog_raw_both("cfg: extras 2\n");
+	/* Extras */
+	set[21] = cfg(extras_category, "1SEG");
+	set[22] = cfg(extras_category, "T-DMB");
+	set[23] = cfg(extras_category, "JP_BOOKREADER");
+	set[24] = cfg(extras_category, "DIGITAL_COMICS");
+	set[26] = cfg(extras_category, "X-RADAR_PORTABLE");
+
+	xlog_raw_both("cfg: photo 3\n");
+	/* Photo */
+	set[27] = cfg(photo_category, "CAMERA");
+	set[28] = cfg(photo_category, "MEMORY_STICK");
+	set[29] = cfg(photo_category, "SYSTEM_STORAGE");
+
+	xlog_raw_both("cfg: music 4\n");
+	/* Music */
+	set[25] = cfg(music_category, "MUSIC_UNLIMITED");
+	set[30] = cfg(music_category, "SENSME_CHANNELS");
+	set[31] = cfg(music_category, "MEMORY_STICK");
+	set[32] = cfg(music_category, "SYSTEM_STORAGE");
+
+	xlog_raw_both("cfg: video 5\n");
+	/* Video */
+	set[33] = cfg(video_category, "MEMORY_STICK");
+	set[34] = cfg(video_category, "SYSTEM_STORAGE");
+
+	xlog_raw_both("cfg: game 6\n");
+	/* Game */
+	set[35] = cfg(game_category, "GAME_SHARING");
+	set[36] = cfg(game_category, "SAVED_DATA_UTILITY_MS");
+	set[37] = cfg(game_category, "SAVED_DATA_UTILITY_EF");
+	set[38] = cfg(game_category, "RESUME_GAME");
+	set[39] = cfg(game_category, "MEMORY_STICK");
+	set[40] = cfg(game_category, "SYSTEM_STORAGE");
+
+	xlog_raw_both("cfg: network 7\n");
+	/* Network */
+	set[41] = cfg(network_category, "ONLINE_MANUAL");
+	set[42] = cfg(network_category, "LOCATION_FREE_PLAYER");
+	set[43] = cfg(network_category, "SKYPE");
+	set[44] = cfg(network_category, "REMOTE_PLAY");
+	set[45] = cfg(network_category, "INTERNET_RADIO");
+	set[46] = cfg(network_category, "RSS_CHANNEL");
+	set[47] = cfg(network_category, "INTERNET_BROWSER");
+	set[48] = cfg(network_category, "INTERNET_SEARCH");
+	set[49] = cfg(network_category, "PLAYSTATION_SPOT");
+	set[50] = cfg(network_category, "GO_MESSENGER");
+
+	xlog_raw_both("cfg: psn 8\n");
+	/* PlayStation�Network */
+	set[51] = cfg(playstation_network_category, "SIGN_UP_OR_ACCOUNT_MANAGEMENT");
+	set[52] = cfg(playstation_network_category, "PLAYSTATION_STORE");
+	set[53] = cfg(playstation_network_category, "INFORMATION_BOARD");
+	xlog_raw_both("cfg: done 9\n");
+
+	/** 
+	* Offsets for patches (for update use prxtool)
+	* @ patch[0] - AddVshItem
+	* @ patch[1] - AddVshItemPatched
+	*/
+
+	switch(devkit)
+	{
+		case FW(0x500):
+		case FW(0x502):
+		case FW(0x503):
+			/* Frostegater */
+			patch[0] = 0x1C468; 
+			patch[1] = 0x1AF40;
+			patch[2] = 0x1D878;
+			patch[3] = 0x1D958;
+			patch[4] = 0x1DA38;
+			patch[5] = 0x1DB18;
+			break;
+				
+		case FW(0x550):
+			/* Frostegater */
+			patch[0] = 0x1D35C;
+			patch[1] = 0x1BD24;
+			patch[2] = 0x1E67C;
+			patch[3] = 0x1E75C;
+			patch[4] = 0x1E83C;
+			patch[5] = 0x1E91C;
+			break;
+
+		case FW(0x620):
+			/* Total_Noob */
+			patch[0] = 0x21E18;
+			patch[1] = 0x206F8;
+			/* Frostegater */
+			patch[2] = 0x231E8;
+			patch[3] = 0x232C8;
+			patch[4] = 0x233A8;
+			patch[5] = 0x2348C;
+			patch[6] = 0x235EC;
+			patch[7] = 0x29944;
+			patch[8] = 0x29954;
+			patch[9] = 0x29964;
+			patch[10] = 0x29978;
+			patch[11] = 0x29988;
+			patch[12] = 0x2A4A8;
+			break;
+
+		case FW(0x635):
+		case FW(0x636):
+		case FW(0x637):
+		case FW(0x638):		
+		case FW(0x639):
+			/* Total_Noob */
+			patch[0] = 0x22608;
+			patch[1] = 0x20EBC;
+			/* Frostegater */
+			patch[2] = 0x239D8;
+			patch[3] = 0x23AB8;
+			patch[4] = 0x23B98;
+			patch[5] = 0x23C7C;
+			patch[6] = 0x23DDC;
+			patch[7] = 0x2A1B4;
+			patch[8] = 0x2A1C4;
+			patch[9] = 0x2A1D4;
+			patch[10] = 0x2A1E8;
+			patch[11] = 0x2A1F8;
+			patch[12] = 0x2AD18;
+			break;
+
+		case FW(0x660):
+			/* codestation */
+			patch[0] = 0x22648;
+			patch[1] = 0x20EFC;
+			/* Frostegater */
+			patch[2] = 0x23A44;
+			patch[3] = 0x23B24;
+			patch[4] = 0x23C04;
+			patch[5] = 0x23CE8;
+			patch[6] = 0x23E48;
+			patch[7] = 0x2A240;
+			patch[8] = 0x2A250;
+			patch[9] = 0x2A260;
+			patch[10] = 0x2A274;
+			patch[11] = 0x2A284;
+			patch[12] = 0x2ADA4;
+			break;
+			
+		default:
+			return -1;
+	}
+
+	xlog_raw_both("ck6: post-ini-parse\n");
+	xlog("settings: USE_PLUGIN=%d HIDE_ALL=%d PSN=%d\n", set[55], set[54], set[6]);
+	xlog("MS: &set=0x%08X &set[55]=0x%08X *(&set[55])=%d\n",
+		(unsigned int)&set[0], (unsigned int)&set[55], set[55]);
+	if (!set[55]) {
+		xlog("USE_PLUGIN=0 at module_start, not installing handler\n");
+		return 0;
+	}
+
+	xlog_raw_both("ck7: pre-sctrlHENSetStartModuleHandler\n");
+	previous = sctrlHENSetStartModuleHandler(OnModuleStart);
+	xlog_raw_both("ck8: post-sctrlHENSetStartModuleHandler\n");
+
+	xlog("module_start done; handler installed\n");
+
+	return 0;
+}
