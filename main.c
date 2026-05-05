@@ -46,7 +46,7 @@ PSP_MODULE_INFO("XMBIH", 0x0007, 1, 3);
 static int xlog_item_count = 0;
 static struct {
 	volatile unsigned char guard[0x200];
-	volatile unsigned char flags[56];
+	volatile unsigned char flags[57];
 } cfg_store;
 
 #define set cfg_store.flags
@@ -310,8 +310,8 @@ int skip(SceVshItem *item, int location)
 	(!idnm("msg_sensme_channels") && (set[30] || set[3])) ||
 	(!idnm("msgshare_ms") && (set[31] || set[3]) && location == 2) ||
 	(!idnm("msg_em") && (set[32] || set[3]) && location == 2) ||
-	(!idnm("msgshare_ms") && set[33] && location == 3) ||
-	(!idnm("msg_em") && set[34] && location == 3) ||
+	(!idnm("msgshare_ms") && (set[33] || set[56]) && location == 3) ||
+	(!idnm("msg_em") && (set[34] || set[56]) && location == 3) ||
 	(!idnm("msgtop_game_gamedl") && (set[35] || set[4])) ||
 	(!idnm("msgtop_game_savedata") && (set[36] || set[4]) && (psp_model == 4 ? location == 5 : location == 0)) ||
 	(!idnm("msgtop_game_savedata") && (set[37] || set[4]) && psp_model == 4 && location == 6) ||
@@ -535,6 +535,7 @@ int module_start(SceSize args, void *argp)
 	set[4] = cfg(global_category, "HIDE_ALL_GAME");
 	set[5] = cfg(global_category, "HIDE_ALL_NETWORK");
 	set[6] = cfg(global_category, "HIDE_ALL_PSN");	
+	set[56] = cfg(global_category, "HIDE_ALL_VIDEO");
 	set[54] = cfg(global_category, "HIDE_ALL");
 	set[55] = cfg(global_category, "USE_PLUGIN");
 
