@@ -1,16 +1,18 @@
 # XMB Item Hider PSP
 
-PSP XMB Item Hider source tree with current work-in-progress fixes and the original reference binary in `online_binary/xmbih.prx`.
+XMB Item Hider plugin source for PSP.
 
-## Included
+## Contents
 
-- plugin source and build files
-- required local headers and static libraries in `include/` and `lib/`
+- source and build files
+- required headers and static libraries in `include/` and `lib/`
 - sample `xmbih.ini`
-- working reference binary in `online_binary/`
+- reference binary in `online_binary/`
 
-## Excluded
+## Build
 
-- generated build artifacts from the local workspace
-- local firmware dump in `F0/`
-- local tool metadata
+Build with the included `Makefile` in a PSP toolchain environment:
+
+```sh
+make
+```
