@@ -242,6 +242,7 @@ static void xlog(const char *fmt, ...)
 
 int (* AddVshItem)(void *a0, int topitem, SceVshItem *item);
 int (* umdIoOpen)(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode);
+u32 topcat_count_patch;
 
 STMOD_HANDLER previous;
 
@@ -273,6 +274,10 @@ static const char *top_category_names[8] = {
 	"msgtop_network",
 	"msg_psn"
 };
+
+static int top_category_hidden_count;
+static int top_category_count_logged;
+static u32 top_category_runtime_obj;
 
 void ClearCaches()
 {
@@ -367,9 +372,95 @@ static int top_category_mode(int index)
 	return 0;
 }
 
+static int get_top_category_hidden_count(void)
+{
+	int count = 0;
+
+	if (set[1] == 2) count++;
+	if (set[2] == 2) count++;
+	if (set[3] == 2) count++;
+	if (set[56] == 2) count++;
+	if (set[4] == 2) count++;
+	if (set[5] == 2) count++;
+	if (set[6] == 2) count++;
+
+	return count;
+}
+
+static int AdjustTopCategoryCountAndGetCount(void *ctx)
+{
+	u32 obj;
+	u32 *slots;
+	int count;
+	int new_count;
+	int i;
+	int out;
+
+	obj = *(u32 *)((char *)ctx + 0xA6C);
+	if (!obj)
+		return 0;
+
+	count = *(int *)(obj + 0x334);
+	if (top_category_hidden_count <= 0)
+		return count;
+
+	if (obj != top_category_runtime_obj) {
+		u32 filtered_slots[8];
+
+		slots = (u32 *)(obj + 0x360);
+		out = 0;
+		for (i = 0; i < count && i < 8; i++) {
+			if (hide_top_category(i))
+				continue;
+			filtered_slots[out++] = slots[i];
+		}
+		while (out < 8) {
+			filtered_slots[out++] = 0;
+		}
+
+		memcpy(slots, filtered_slots, sizeof(filtered_slots));
+		top_category_runtime_obj = obj;
+		xlog("topcat: runtime slots compacted obj=0x%08X slots=0x%08X\n",
+			obj, (u32)slots);
+		xlog("topcat: ctx e70=%08X,%08X,%08X,%08X,%08X,%08X\n",
+			*(u32 *)((char *)ctx + 0xE70),
+			*(u32 *)((char *)ctx + 0xE74),
+			*(u32 *)((char *)ctx + 0xE78),
+			*(u32 *)((char *)ctx + 0xE7C),
+			*(u32 *)((char *)ctx + 0xE80),
+			*(u32 *)((char *)ctx + 0xE84));
+		xlog("topcat: ctx e88=%08X,%08X,%08X,%08X\n",
+			*(u32 *)((char *)ctx + 0xE88),
+			*(u32 *)((char *)ctx + 0xE94),
+			*(u32 *)((char *)ctx + 0xEA0),
+			*(u32 *)((char *)ctx + 0xEAC));
+	}
+
+	new_count = count - top_category_hidden_count;
+	if (new_count < 1)
+		new_count = 1;
+
+	if (count > new_count) {
+		*(int *)(obj + 0x334) = new_count;
+		if (!top_category_count_logged) {
+			top_category_count_logged = 1;
+			xlog("topcat: runtime count patched %d -> %d\n", count, new_count);
+		}
+		return new_count;
+	}
+
+	return count;
+}
+
 static void PatchTopCategories(u32 text_addr)
 {
+	u32 *meta0;
+	u32 *meta1;
+	u32 *meta2;
 	XmbTopCategory *table;
+	u32 filtered_meta0[8];
+	u32 filtered_meta1[8];
+	u32 filtered_meta2[8];
 	XmbTopCategory filtered[8];
 	int i;
 	int out = 0;
@@ -385,6 +476,9 @@ static void PatchTopCategories(u32 text_addr)
 		xlog("topcat: table not found\n");
 		return;
 	}
+	meta0 = (u32 *)((char *)table - (8 * sizeof(u32) * 3));
+	meta1 = (u32 *)((char *)table - (8 * sizeof(u32) * 2));
+	meta2 = (u32 *)((char *)table - (8 * sizeof(u32) * 1));
 
 	for (i = 0; i < 8; i++) {
 		int hide = hide_top_category(i);
@@ -395,6 +489,9 @@ static void PatchTopCategories(u32 text_addr)
 			continue;
 		}
 
+		filtered_meta0[out] = meta0[i];
+		filtered_meta1[out] = meta1[i];
+		filtered_meta2[out] = meta2[i];
 		memcpy(&filtered[out], &table[i], sizeof(filtered[out]));
 		out++;
 	}
@@ -405,12 +502,19 @@ static void PatchTopCategories(u32 text_addr)
 	}
 
 	while (out < 8) {
+		filtered_meta0[out] = 0;
+		filtered_meta1[out] = 0;
+		filtered_meta2[out] = 0;
 		memset(&filtered[out], 0, sizeof(filtered[out]));
 		out++;
 	}
 
+	memcpy(meta0, filtered_meta0, sizeof(filtered_meta0));
+	memcpy(meta1, filtered_meta1, sizeof(filtered_meta1));
+	memcpy(meta2, filtered_meta2, sizeof(filtered_meta2));
 	memcpy(table, filtered, sizeof(filtered));
-	xlog("topcat: table=0x%08X compacted\n", (u32)table);
+	xlog("topcat: meta0=0x%08X meta1=0x%08X meta2=0x%08X table=0x%08X compacted\n",
+		(u32)meta0, (u32)meta1, (u32)meta2, (u32)table);
 }
 
 int skip(SceVshItem *item, int location)
@@ -494,6 +598,34 @@ static int xlog_hook(int loc, SceVshItem *item)
 	return show;
 }
 
+static int adjust_topitem_for_hidden_categories(int location, int topitem)
+{
+	int shift = 0;
+
+	switch (location) {
+		case 1:
+			shift = (set[1] == 2);
+			break;
+		case 2:
+			shift = (set[1] == 2) + (set[2] == 2);
+			break;
+		case 3:
+			shift = (set[1] == 2) + (set[2] == 2) + (set[3] == 2);
+			break;
+		case 4:
+		case 5:
+		case 6:
+			shift = (set[1] == 2) + (set[2] == 2) + (set[3] == 2) + (set[56] == 2);
+			break;
+	}
+
+	topitem -= shift;
+	if (topitem < 0)
+		topitem = 0;
+
+	return topitem;
+}
+
 int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 {
 	if(xlog_hook(0, item))
@@ -504,6 +636,7 @@ int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedPhoto(void *a0, int topitem, SceVshItem *item)
 {
+	topitem = adjust_topitem_for_hidden_categories(1, topitem);
 	if(xlog_hook(1, item))
 		AddVshItem(a0, topitem, item);
 
@@ -512,6 +645,7 @@ int AddVshItemPatchedPhoto(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedMusic(void *a0, int topitem, SceVshItem *item)
 {
+	topitem = adjust_topitem_for_hidden_categories(2, topitem);
 	if(xlog_hook(2, item))
 		AddVshItem(a0, topitem, item);
 
@@ -520,6 +654,7 @@ int AddVshItemPatchedMusic(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedVideo(void *a0, int topitem, SceVshItem *item)
 {
+	topitem = adjust_topitem_for_hidden_categories(3, topitem);
 	if(xlog_hook(3, item))
 		AddVshItem(a0, topitem, item);
 
@@ -528,6 +663,7 @@ int AddVshItemPatchedVideo(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedGame(void *a0, int topitem, SceVshItem *item)
 {
+	topitem = adjust_topitem_for_hidden_categories(4, topitem);
 	if(xlog_hook(4, item))
 		AddVshItem(a0, topitem, item);
 
@@ -536,6 +672,7 @@ int AddVshItemPatchedGame(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedGameSavedataMs(void *a0, int topitem, SceVshItem *item)
 {
+	topitem = adjust_topitem_for_hidden_categories(5, topitem);
 	if(xlog_hook(5, item))
 		AddVshItem(a0, topitem, item);
 
@@ -544,6 +681,7 @@ int AddVshItemPatchedGameSavedataMs(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedGameSavedataEf(void *a0, int topitem, SceVshItem *item)
 {
+	topitem = adjust_topitem_for_hidden_categories(6, topitem);
 	if(xlog_hook(6, item))
 		AddVshItem(a0, topitem, item);
 
@@ -569,6 +707,15 @@ void PatchVshMain(u32 text_addr)
 	/* Permanently items */
 	MAKE_CALL(text_addr + patch[1], AddVshItemPatched);
 	xlog("  patch[1] post=0x%08X\n", *(u32 *)(text_addr + patch[1]));
+
+	if (topcat_count_patch) {
+		MAKE_CALL(text_addr + topcat_count_patch, AdjustTopCategoryCountAndGetCount);
+		_sw(0x02402021, text_addr + topcat_count_patch + 4);
+		xlog("  topcat count patch=0x%X site=0x%08X post=0x%08X delay=0x%08X\n",
+			topcat_count_patch, text_addr + topcat_count_patch,
+			*(u32 *)(text_addr + topcat_count_patch),
+			*(u32 *)(text_addr + topcat_count_patch + 4));
+	}
 
 	/* Photo Memory Stick */
 	MAKE_CALL(text_addr + patch[2], AddVshItemPatchedPhoto);
@@ -834,6 +981,7 @@ int module_start(SceSize args, void *argp)
 			/* codestation */
 			patch[0] = 0x22648;
 			patch[1] = 0x20EFC;
+			topcat_count_patch = 0x20890;
 			/* Frostegater */
 			patch[2] = 0x23A44;
 			patch[3] = 0x23B24;
@@ -852,8 +1000,13 @@ int module_start(SceSize args, void *argp)
 			return -1;
 	}
 
+	top_category_hidden_count = get_top_category_hidden_count();
+	top_category_count_logged = 0;
+	top_category_runtime_obj = 0;
+
 	xlog_raw_both("ck6: post-ini-parse\n");
 	xlog("settings: USE_PLUGIN=%d HIDE_ALL=%d PSN=%d\n", set[55], set[54], set[6]);
+	xlog("topcat: hidden count=%d\n", top_category_hidden_count);
 	xlog("MS: &set=0x%08X &set[55]=0x%08X *(&set[55])=%d\n",
 		(unsigned int)&set[0], (unsigned int)&set[55], set[55]);
 	if (!set[55]) {
