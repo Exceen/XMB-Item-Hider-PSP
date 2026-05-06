@@ -1,6 +1,8 @@
 .DS_Store
 .claude/
 F0/
+Flash0 decrypted/
+flahes-pspGo/
 *.o
 *.elf
 *.prx

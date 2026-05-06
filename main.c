@@ -278,6 +278,7 @@ static const char *top_category_names[8] = {
 static int top_category_hidden_count;
 static int top_category_count_logged;
 static u32 top_category_runtime_obj;
+static int top_category_runtime_return_override_logged;
 
 void ClearCaches()
 {
@@ -328,8 +329,24 @@ static XmbTopCategory *find_top_category_table(u32 text_addr)
 	return NULL;
 }
 
-static int hide_top_category(int index)
+static int top_category_requested_hidden(int index)
 {
+	if (set[54] == 2) {
+		switch (index) {
+			case 0:
+			case 1:
+			case 2:
+			case 3:
+			case 4:
+			case 5:
+			case 6:
+			case 7:
+				return 1;
+			default:
+				return 0;
+		}
+	}
+
 	switch (index) {
 		case 1:
 			return set[1] == 2;
@@ -350,8 +367,29 @@ static int hide_top_category(int index)
 	return 0;
 }
 
+static int hide_top_category(int index)
+{
+	return top_category_requested_hidden(index);
+}
+
 static int top_category_mode(int index)
 {
+	if (set[54] == 2) {
+		switch (index) {
+			case 0:
+			case 1:
+			case 2:
+			case 3:
+			case 4:
+			case 5:
+			case 6:
+			case 7:
+				return 2;
+			default:
+				return 0;
+		}
+	}
+
 	switch (index) {
 		case 1:
 			return set[1];
@@ -375,14 +413,12 @@ static int top_category_mode(int index)
 static int get_top_category_hidden_count(void)
 {
 	int count = 0;
+	int i;
 
-	if (set[1] == 2) count++;
-	if (set[2] == 2) count++;
-	if (set[3] == 2) count++;
-	if (set[56] == 2) count++;
-	if (set[4] == 2) count++;
-	if (set[5] == 2) count++;
-	if (set[6] == 2) count++;
+	for (i = 0; i < 8; i++) {
+		if (top_category_requested_hidden(i))
+			count++;
+	}
 
 	return count;
 }
@@ -393,8 +429,6 @@ static int AdjustTopCategoryCountAndGetCount(void *ctx)
 	u32 *slots;
 	int count;
 	int new_count;
-	int i;
-	int out;
 
 	obj = *(u32 *)((char *)ctx + 0xA6C);
 	if (!obj)
@@ -405,22 +439,41 @@ static int AdjustTopCategoryCountAndGetCount(void *ctx)
 		return count;
 
 	if (obj != top_category_runtime_obj) {
-		u32 filtered_slots[8];
+		u32 arr330;
 
 		slots = (u32 *)(obj + 0x360);
-		out = 0;
-		for (i = 0; i < count && i < 8; i++) {
-			if (hide_top_category(i))
-				continue;
-			filtered_slots[out++] = slots[i];
+		arr330 = *(u32 *)(obj + 0x330);
+		xlog("topcat: obj hdr 330=%08X 334=%08X 338=%08X 33C=%08X 340=%08X 344=%08X 348=%08X 34C=%08X 350=%08X 354=%08X 358=%08X 35C=%08X\n",
+			arr330,
+			*(u32 *)(obj + 0x334),
+			*(u32 *)(obj + 0x338),
+			*(u32 *)(obj + 0x33C),
+			*(u32 *)(obj + 0x340),
+			*(u32 *)(obj + 0x344),
+			*(u32 *)(obj + 0x348),
+			*(u32 *)(obj + 0x34C),
+			*(u32 *)(obj + 0x350),
+			*(u32 *)(obj + 0x354),
+			*(u32 *)(obj + 0x358),
+			*(u32 *)(obj + 0x35C));
+		if (arr330) {
+			xlog("topcat: arr330=%08X [%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X]\n",
+				arr330,
+				*(u32 *)(arr330 + 0x00),
+				*(u32 *)(arr330 + 0x04),
+				*(u32 *)(arr330 + 0x08),
+				*(u32 *)(arr330 + 0x0C),
+				*(u32 *)(arr330 + 0x10),
+				*(u32 *)(arr330 + 0x14),
+				*(u32 *)(arr330 + 0x18),
+				*(u32 *)(arr330 + 0x1C));
 		}
-		while (out < 8) {
-			filtered_slots[out++] = 0;
-		}
-
-		memcpy(slots, filtered_slots, sizeof(filtered_slots));
+		xlog("topcat: slots=%08X [%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X]\n",
+			(u32)slots,
+			slots[0], slots[1], slots[2], slots[3],
+			slots[4], slots[5], slots[6], slots[7]);
 		top_category_runtime_obj = obj;
-		xlog("topcat: runtime slots compacted obj=0x%08X slots=0x%08X\n",
+		xlog("topcat: runtime slots left unchanged obj=0x%08X slots=0x%08X\n",
 			obj, (u32)slots);
 		xlog("topcat: ctx e70=%08X,%08X,%08X,%08X,%08X,%08X\n",
 			*(u32 *)((char *)ctx + 0xE70),
@@ -441,6 +494,15 @@ static int AdjustTopCategoryCountAndGetCount(void *ctx)
 		new_count = 1;
 
 	if (count > new_count) {
+		if (hide_top_category(0)) {
+			if (!top_category_runtime_return_override_logged) {
+				top_category_runtime_return_override_logged = 1;
+				xlog("topcat: settings-hidden skip runtime count patch %d -> %d\n",
+					count, new_count);
+			}
+			return count;
+		}
+
 		*(int *)(obj + 0x334) = new_count;
 		if (!top_category_count_logged) {
 			top_category_count_logged = 1;
@@ -466,8 +528,7 @@ static void PatchTopCategories(u32 text_addr)
 	int out = 0;
 	int changed = 0;
 
-	if (!(set[1] == 2 || set[2] == 2 || set[3] == 2 || set[56] == 2 ||
-	      set[4] == 2 || set[5] == 2 || set[6] == 2)) {
+	if (top_category_hidden_count <= 0) {
 		return;
 	}
 
@@ -553,7 +614,7 @@ int skip(SceVshItem *item, int location)
 	(!idnm("msg_tdmb") && (set[22] || set[1])) ||
 	(!idnm("msg_bookreader") && (set[23] || set[1])) ||
 	(!idnm("msg_digitalcomics") && (set[24] || set[1])) ||
-	(!idnm("msg_music_unlimited") && (set[25] || set[1])) ||
+	(!idnm("msg_music_unlimited") && (set[25] || set[3])) ||
 	(!idnm("msg_xradar_portable") && (set[26] || set[1])) ||
 	(!idnm("msgtop_camera") && (set[27] || set[2])) ||
 	(!idnm("msgshare_ms") && (set[28] || set[2]) && location == 1) ||
@@ -598,36 +659,101 @@ static int xlog_hook(int loc, SceVshItem *item)
 	return show;
 }
 
-static int adjust_topitem_for_hidden_categories(int location, int topitem)
+static int count_hidden_top_categories_before(int topitem)
 {
 	int shift = 0;
+	int i;
 
-	switch (location) {
-		case 1:
-			shift = (set[1] == 2);
-			break;
-		case 2:
-			shift = (set[1] == 2) + (set[2] == 2);
-			break;
-		case 3:
-			shift = (set[1] == 2) + (set[2] == 2) + (set[3] == 2);
-			break;
-		case 4:
-		case 5:
-		case 6:
-			shift = (set[1] == 2) + (set[2] == 2) + (set[3] == 2) + (set[56] == 2);
-			break;
+	for (i = 0; i < topitem && i < 8; i++) {
+		if (hide_top_category(i))
+			shift++;
 	}
 
-	topitem -= shift;
+	return shift;
+}
+
+static int adjust_topitem_for_hidden_categories(int topitem)
+{
+	topitem -= count_hidden_top_categories_before(topitem);
 	if (topitem < 0)
 		topitem = 0;
 
 	return topitem;
 }
 
+static int is_ark_custom_item(const char *text)
+{
+	return !strcmp(text, "xmbmsgtop_sysconf_configuration") ||
+		!strcmp(text, "xmbmsgtop_sysconf_plugins") ||
+		!strcmp(text, "xmbmsgtop_custom_launcher") ||
+		!strcmp(text, "xmbmsgtop_custom_app") ||
+		!strcmp(text, "xmbmsgtop_150_reboot");
+}
+
+static int is_game_resume_item(const char *text)
+{
+	return !strcmp(text, "msg_game_hibernation");
+}
+
+static int remap_ark_topitem(int incoming_topitem, int *out_topitem)
+{
+	/*
+	 * Keep ARK's behavior constrained to its intended homes:
+	 * - Extras, when ARK is injecting through the Extras path and Extras is visible
+	 * - Game, when Extras is hidden and Game is visible
+	 * - nothing, when neither destination is visible
+	 */
+	if (incoming_topitem == 1) {
+		if (!hide_top_category(1)) {
+			*out_topitem = adjust_topitem_for_hidden_categories(incoming_topitem);
+			return 1;
+		}
+
+		if (!hide_top_category(5)) {
+			*out_topitem = adjust_topitem_for_hidden_categories(5);
+			return 1;
+		}
+
+		return 0;
+	}
+
+	if (!hide_top_category(5)) {
+		int base_topitem = incoming_topitem < 5 ? 5 : incoming_topitem;
+		*out_topitem = adjust_topitem_for_hidden_categories(base_topitem);
+		return 1;
+	}
+
+	return 0;
+}
+
 int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 {
+	if (is_ark_custom_item(item->text)) {
+		int original_topitem = topitem;
+		int mapped_topitem = topitem;
+
+		if (!remap_ark_topitem(topitem, &mapped_topitem)) {
+			xlog("ark item: text='%s' topitem=%d dropped\n",
+				item->text, original_topitem);
+			return 0;
+		}
+
+		topitem = mapped_topitem;
+
+		xlog("ark item: text='%s' topitem=%d adjusted=%d\n",
+			item->text, original_topitem, topitem);
+	}
+	else if (is_game_resume_item(item->text)) {
+		int original_topitem = topitem;
+
+		topitem = adjust_topitem_for_hidden_categories(topitem);
+		xlog("resume item: text='%s' topitem=%d adjusted=%d\n",
+			item->text, original_topitem, topitem);
+	}
+	else {
+		topitem = adjust_topitem_for_hidden_categories(topitem);
+	}
+
 	if(xlog_hook(0, item))
 		AddVshItem(a0, topitem, item);
 
@@ -636,7 +762,7 @@ int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedPhoto(void *a0, int topitem, SceVshItem *item)
 {
-	topitem = adjust_topitem_for_hidden_categories(1, topitem);
+	topitem = adjust_topitem_for_hidden_categories(topitem);
 	if(xlog_hook(1, item))
 		AddVshItem(a0, topitem, item);
 
@@ -645,7 +771,7 @@ int AddVshItemPatchedPhoto(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedMusic(void *a0, int topitem, SceVshItem *item)
 {
-	topitem = adjust_topitem_for_hidden_categories(2, topitem);
+	topitem = adjust_topitem_for_hidden_categories(topitem);
 	if(xlog_hook(2, item))
 		AddVshItem(a0, topitem, item);
 
@@ -654,7 +780,7 @@ int AddVshItemPatchedMusic(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedVideo(void *a0, int topitem, SceVshItem *item)
 {
-	topitem = adjust_topitem_for_hidden_categories(3, topitem);
+	topitem = adjust_topitem_for_hidden_categories(topitem);
 	if(xlog_hook(3, item))
 		AddVshItem(a0, topitem, item);
 
@@ -663,7 +789,7 @@ int AddVshItemPatchedVideo(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedGame(void *a0, int topitem, SceVshItem *item)
 {
-	topitem = adjust_topitem_for_hidden_categories(4, topitem);
+	topitem = adjust_topitem_for_hidden_categories(topitem);
 	if(xlog_hook(4, item))
 		AddVshItem(a0, topitem, item);
 
@@ -672,7 +798,7 @@ int AddVshItemPatchedGame(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedGameSavedataMs(void *a0, int topitem, SceVshItem *item)
 {
-	topitem = adjust_topitem_for_hidden_categories(5, topitem);
+	topitem = adjust_topitem_for_hidden_categories(topitem);
 	if(xlog_hook(5, item))
 		AddVshItem(a0, topitem, item);
 
@@ -681,7 +807,7 @@ int AddVshItemPatchedGameSavedataMs(void *a0, int topitem, SceVshItem *item)
 
 int AddVshItemPatchedGameSavedataEf(void *a0, int topitem, SceVshItem *item)
 {
-	topitem = adjust_topitem_for_hidden_categories(6, topitem);
+	topitem = adjust_topitem_for_hidden_categories(topitem);
 	if(xlog_hook(6, item))
 		AddVshItem(a0, topitem, item);
 
@@ -1006,6 +1132,10 @@ int module_start(SceSize args, void *argp)
 
 	xlog_raw_both("ck6: post-ini-parse\n");
 	xlog("settings: USE_PLUGIN=%d HIDE_ALL=%d PSN=%d\n", set[55], set[54], set[6]);
+	if (set[0] == 2)
+		xlog("topcat: HIDE_ALL_SETTINGS=2 not supported; ignoring top-category hide\n");
+	if (set[54] == 2)
+		xlog("topcat: HIDE_ALL=2 blank-row mode enabled\n");
 	xlog("topcat: hidden count=%d\n", top_category_hidden_count);
 	xlog("MS: &set=0x%08X &set[55]=0x%08X *(&set[55])=%d\n",
 		(unsigned int)&set[0], (unsigned int)&set[55], set[55]);
