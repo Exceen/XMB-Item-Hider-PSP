@@ -255,6 +255,25 @@ char *game_category = "Game";
 char *network_category = "Network";
 char *playstation_network_category = "PlayStation\xAENetwork";
 
+typedef struct
+{
+	char icon_id[4];
+	char focus_id[4];
+	char unk_id[4];
+	char text[0x18];
+} XmbTopCategory;
+
+static const char *top_category_names[8] = {
+	"msgshare_settings",
+	"msgtop_extras",
+	"msgtop_photo",
+	"msgtop_music",
+	"msgtop_video",
+	"msgshare_game",
+	"msgtop_network",
+	"msg_psn"
+};
+
 void ClearCaches()
 {
 	sceKernelDcacheWritebackAll();
@@ -264,6 +283,134 @@ void ClearCaches()
 int cfg(char *category, char *fmt)
 {
 	return ini_getlhex(category, fmt, 0, ini_path);
+}
+
+static int text_field_matches(const char *field, const char *name, int size)
+{
+	int i;
+
+	for (i = 0; i < size; i++) {
+		if (field[i] != name[i])
+			return 0;
+		if (name[i] == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+static XmbTopCategory *find_top_category_table(u32 text_addr)
+{
+	char *base = (char *)text_addr;
+	int limit = 0x56000 - (8 * (int)sizeof(XmbTopCategory));
+	int i, j;
+
+	for (i = 0; i < limit; i++) {
+		XmbTopCategory *table = (XmbTopCategory *)(base + i);
+
+		if (!text_field_matches(table[0].text, top_category_names[0], sizeof(table[0].text)))
+			continue;
+
+		for (j = 1; j < 8; j++) {
+			if (!text_field_matches(table[j].text, top_category_names[j], sizeof(table[j].text)))
+				break;
+		}
+
+		if (j == 8)
+			return table;
+	}
+
+	return NULL;
+}
+
+static int hide_top_category(int index)
+{
+	switch (index) {
+		case 1:
+			return set[1] == 2;
+		case 2:
+			return set[2] == 2;
+		case 3:
+			return set[3] == 2;
+		case 4:
+			return set[56] == 2;
+		case 5:
+			return set[4] == 2;
+		case 6:
+			return set[5] == 2;
+		case 7:
+			return set[6] == 2;
+	}
+
+	return 0;
+}
+
+static int top_category_mode(int index)
+{
+	switch (index) {
+		case 1:
+			return set[1];
+		case 2:
+			return set[2];
+		case 3:
+			return set[3];
+		case 4:
+			return set[56];
+		case 5:
+			return set[4];
+		case 6:
+			return set[5];
+		case 7:
+			return set[6];
+	}
+
+	return 0;
+}
+
+static void PatchTopCategories(u32 text_addr)
+{
+	XmbTopCategory *table;
+	XmbTopCategory filtered[8];
+	int i;
+	int out = 0;
+	int changed = 0;
+
+	if (!(set[1] == 2 || set[2] == 2 || set[3] == 2 || set[56] == 2 ||
+	      set[4] == 2 || set[5] == 2 || set[6] == 2)) {
+		return;
+	}
+
+	table = find_top_category_table(text_addr);
+	if (!table) {
+		xlog("topcat: table not found\n");
+		return;
+	}
+
+	for (i = 0; i < 8; i++) {
+		int hide = hide_top_category(i);
+		if (hide) {
+			changed = 1;
+			xlog("topcat: hiding '%s' mode=%d\n", table[i].text,
+				top_category_mode(i));
+			continue;
+		}
+
+		memcpy(&filtered[out], &table[i], sizeof(filtered[out]));
+		out++;
+	}
+
+	if (!changed) {
+		xlog("topcat: no supported category set to 2\n");
+		return;
+	}
+
+	while (out < 8) {
+		memset(&filtered[out], 0, sizeof(filtered[out]));
+		out++;
+	}
+
+	memcpy(table, filtered, sizeof(filtered));
+	xlog("topcat: table=0x%08X compacted\n", (u32)table);
 }
 
 int skip(SceVshItem *item, int location)
@@ -472,6 +619,8 @@ void PatchVshMain(u32 text_addr)
 		umdIoOpen = umddrv->funcs->IoOpen;
 		umddrv->funcs->IoOpen = umdIoOpenPatched;
 	}
+
+	PatchTopCategories(text_addr);
 
 	ClearCaches();
 }
