@@ -159,8 +159,11 @@ void sctrlFlushCache(void);
 
 /**
  * Missing PSPSDK Functions
+ *
+ * (declaration removed -- modern pspsdk's pspintrman_kernel.h already
+ * declares this as `int sceKernelQuerySystemCall(void *function);` and
+ * keeping both visible causes a type conflict.)
  */
-u32 sceKernelQuerySystemCall(void * function);
 
 /**
  * Register the default VRAM handler for PSX exploit, returns the previous handler
