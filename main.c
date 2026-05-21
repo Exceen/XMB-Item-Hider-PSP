@@ -156,8 +156,68 @@ static void xlog(const char *fmt, ...)
 	(void)fmt;
 }
 
+/* AddVshItem here is *not* the literal real AddVshItem; it's whatever the
+   JAL at patch[1] points to right before we overwrite it. On stock firmware
+   that's the real function; on ARK-5/ARK-4 it's xmbctrl's wrapper (which
+   chain-injects the CFW menu items and then forwards to the real one).
+   Wrappers calling this pointer therefore preserve xmbctrl's injection. */
 int (* AddVshItem)(void *a0, int topitem, SceVshItem *item);
 int (* umdIoOpen)(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode);
+
+/* File-scope replacement for the original GCC-nested-function definition
+   of umdIoOpenPatched inside PatchVshMain. The isofs driver retains this
+   pointer indefinitely; a nested function's address is a stack-resident
+   trampoline that gets clobbered when PatchVshMain returns, which on
+   modern psp-gcc + ARK-5 causes the PSP to crash the moment a UMD's
+   preview is loaded and isofs calls into us. As a top-level function it
+   captures nothing from PatchVshMain (it only references globals), so the
+   lift is behaviourally identical except it doesn't crash. */
+extern char *game_category;     /* defined further down */
+extern char *global_category;
+extern int   cfg(char *category, char *fmt);
+static int umdIoOpenPatched(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode)
+{
+	return (strcmp(file, "/PSP_GAME/SYSDIR/UPDATE/PARAM.SFO") == 0 &&
+	        (cfg(game_category, "UMD_UPDATE") ||
+	         cfg(global_category, "HIDE_ALL") ||
+	         set[4]))
+	       ? -1
+	       : umdIoOpen(arg, file, flags, mode);
+}
+
+/* Once we've force-forwarded one xmbctrl trigger, xmbctrl's items_added
+   static flips and the CFW menus are injected. Every subsequent trigger
+   item can then go through skip() normally, so the user gets to hide them.
+   Without this gate we'd force-forward every trigger forever and lose
+   the ability to hide them. */
+static int xmbctrl_triggered = 0;
+
+/* Prologue-patch trampoline buffer. We attempt to patch the real
+   AddVshItem's first two instructions to `j AddVshItemFilter; nop`. If it
+   takes effect, every call -- including the xmbctrl wrapper forwarding the
+   trigger item to the real function -- routes through our filter so the
+   first trigger can ALSO be hidden. If it doesn't take effect (we observed
+   this on v1.3fix2-derived code), the only consequence is that one
+   trigger item still shows; the rest of the code still works. */
+static u32 add_vsh_trampoline[4] __attribute__((section(".data"), aligned(4))) = { 0, 0, 0, 0 };
+
+int skip(SceVshItem *item, int location);  /* forward decl, defined further down */
+
+int AddVshItemFilter(void *a0, int topitem, SceVshItem *item)
+{
+	/* Items reaching us here either came from xmbctrl forwarding (the
+	   trigger item, or its CFW item insertions) or any other caller of
+	   the real AddVshItem. Apply the user's hide rules and forward via
+	   the trampoline if allowed. Location 0 is the default; the
+	   trigger items and CFW item names don't depend on location, so
+	   that's fine. */
+	if(skip(item, 0)) {
+		int (*trampoline)(void *, int, SceVshItem *) =
+			(int(*)(void *, int, SceVshItem *))add_vsh_trampoline;
+		return trampoline(a0, topitem, item);
+	}
+	return 0;
+}
 u32 topcat_count_patch;
 
 STMOD_HANDLER previous;
@@ -432,13 +492,7 @@ static int AdjustTopCategoryCountAndGetCount(void *ctx)
 
 static void PatchTopCategories(u32 text_addr)
 {
-	u32 *meta0;
-	u32 *meta1;
-	u32 *meta2;
 	XmbTopCategory *table;
-	u32 filtered_meta0[8];
-	u32 filtered_meta1[8];
-	u32 filtered_meta2[8];
 	XmbTopCategory filtered[8];
 	int i;
 	int out = 0;
@@ -453,9 +507,17 @@ static void PatchTopCategories(u32 text_addr)
 		xlog("topcat: table not found\n");
 		return;
 	}
-	meta0 = (u32 *)((char *)table - (8 * sizeof(u32) * 3));
-	meta1 = (u32 *)((char *)table - (8 * sizeof(u32) * 2));
-	meta2 = (u32 *)((char *)table - (8 * sizeof(u32) * 1));
+
+	/* Compact the XmbTopCategory entries (icons + text) only. We previously
+	   also mutated three u32[8] arrays sitting immediately before the
+	   table (wad11656's "meta0/meta1/meta2"), but their purpose is
+	   unknown -- and on ARK-5 the UMD-preview code path indexes into one
+	   of them by the original (pre-compaction) category index, so
+	   zero-padding the tail crashed the system when a UMD was inserted
+	   with any category hidden. Leaving them alone fixes the crash, and
+	   the visual category hide still works because the runtime count
+	   patch (AdjustTopCategoryCountAndGetCount) is what actually shrinks
+	   the column count vshmain renders. */
 
 	for (i = 0; i < 8; i++) {
 		int hide = hide_top_category(i);
@@ -466,9 +528,6 @@ static void PatchTopCategories(u32 text_addr)
 			continue;
 		}
 
-		filtered_meta0[out] = meta0[i];
-		filtered_meta1[out] = meta1[i];
-		filtered_meta2[out] = meta2[i];
 		memcpy(&filtered[out], &table[i], sizeof(filtered[out]));
 		out++;
 	}
@@ -479,19 +538,12 @@ static void PatchTopCategories(u32 text_addr)
 	}
 
 	while (out < 8) {
-		filtered_meta0[out] = 0;
-		filtered_meta1[out] = 0;
-		filtered_meta2[out] = 0;
 		memset(&filtered[out], 0, sizeof(filtered[out]));
 		out++;
 	}
 
-	memcpy(meta0, filtered_meta0, sizeof(filtered_meta0));
-	memcpy(meta1, filtered_meta1, sizeof(filtered_meta1));
-	memcpy(meta2, filtered_meta2, sizeof(filtered_meta2));
 	memcpy(table, filtered, sizeof(filtered));
-	xlog("topcat: meta0=0x%08X meta1=0x%08X meta2=0x%08X table=0x%08X compacted\n",
-		(u32)meta0, (u32)meta1, (u32)meta2, (u32)table);
+	xlog("topcat: table=0x%08X compacted\n", (u32)table);
 }
 
 int skip(SceVshItem *item, int location)
@@ -637,6 +689,25 @@ static int remap_ark_topitem(int incoming_topitem, int *out_topitem)
 	return 0;
 }
 
+/* xmbctrl injects its CFW menu items the first time it sees one of these
+   text keys ("items_added" static flag in xmbctrl flips on first match).
+   If our wrapper hides any of them via skip(), xmbctrl never gets the
+   item, the flag stays 0, and the CFW menus never appear. To keep them
+   visible we force-forward trigger items regardless of the user's hide
+   flag. The user can no longer hide GAME_SHARING / SAVED_DATA_UTILITY_MS
+   / DIGITAL_COMICS / 1SEG / T-DMB / JP_BOOKREADER / X-RADAR_PORTABLE on
+   ARK-5 -- that's the tradeoff. */
+static int is_xmbctrl_trigger(const char *text)
+{
+	return  !strcmp(text, "msgtop_game_gamedl")  ||
+	        !strcmp(text, "msgtop_game_savedata") ||
+	        !strcmp(text, "msg_digitalcomics")    ||
+	        !strcmp(text, "msg_bookreader")       ||
+	        !strcmp(text, "msg_1seg")             ||
+	        !strcmp(text, "msg_xradar_portable")  ||
+	        !strcmp(text, "msg_tdmb");
+}
+
 int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 {
 	if (is_ark_custom_item(item->text)) {
@@ -665,7 +736,14 @@ int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 		topitem = adjust_topitem_for_hidden_categories(topitem);
 	}
 
-	if(xlog_hook(0, item))
+	/* Force-forward only the FIRST xmbctrl trigger we see -- that flips
+	   xmbctrl's items_added flag, so the CFW menu items get injected.
+	   Subsequent triggers fall through to xlog_hook (skip()) so the user
+	   can hide them. The prologue patch above, if it takes effect, also
+	   filters this first trigger's forward so even it gets hidden. */
+	int force_trigger = is_xmbctrl_trigger(item->text) && !xmbctrl_triggered;
+	if(force_trigger) xmbctrl_triggered = 1;
+	if(force_trigger || xlog_hook(0, item))
 		AddVshItem(a0, topitem, item);
 
 	return 0;
@@ -674,7 +752,9 @@ int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 int AddVshItemPatchedPhoto(void *a0, int topitem, SceVshItem *item)
 {
 	topitem = adjust_topitem_for_hidden_categories(topitem);
-	if(xlog_hook(1, item))
+	int force_trigger = is_xmbctrl_trigger(item->text) && !xmbctrl_triggered;
+	if(force_trigger) xmbctrl_triggered = 1;
+	if(force_trigger || xlog_hook(1, item))
 		AddVshItem(a0, topitem, item);
 
 	return 0;
@@ -683,7 +763,9 @@ int AddVshItemPatchedPhoto(void *a0, int topitem, SceVshItem *item)
 int AddVshItemPatchedMusic(void *a0, int topitem, SceVshItem *item)
 {
 	topitem = adjust_topitem_for_hidden_categories(topitem);
-	if(xlog_hook(2, item))
+	int force_trigger = is_xmbctrl_trigger(item->text) && !xmbctrl_triggered;
+	if(force_trigger) xmbctrl_triggered = 1;
+	if(force_trigger || xlog_hook(2, item))
 		AddVshItem(a0, topitem, item);
 
 	return 0;
@@ -692,7 +774,9 @@ int AddVshItemPatchedMusic(void *a0, int topitem, SceVshItem *item)
 int AddVshItemPatchedVideo(void *a0, int topitem, SceVshItem *item)
 {
 	topitem = adjust_topitem_for_hidden_categories(topitem);
-	if(xlog_hook(3, item))
+	int force_trigger = is_xmbctrl_trigger(item->text) && !xmbctrl_triggered;
+	if(force_trigger) xmbctrl_triggered = 1;
+	if(force_trigger || xlog_hook(3, item))
 		AddVshItem(a0, topitem, item);
 
 	return 0;
@@ -701,7 +785,9 @@ int AddVshItemPatchedVideo(void *a0, int topitem, SceVshItem *item)
 int AddVshItemPatchedGame(void *a0, int topitem, SceVshItem *item)
 {
 	topitem = adjust_topitem_for_hidden_categories(topitem);
-	if(xlog_hook(4, item))
+	int force_trigger = is_xmbctrl_trigger(item->text) && !xmbctrl_triggered;
+	if(force_trigger) xmbctrl_triggered = 1;
+	if(force_trigger || xlog_hook(4, item))
 		AddVshItem(a0, topitem, item);
 
 	return 0;
@@ -710,7 +796,9 @@ int AddVshItemPatchedGame(void *a0, int topitem, SceVshItem *item)
 int AddVshItemPatchedGameSavedataMs(void *a0, int topitem, SceVshItem *item)
 {
 	topitem = adjust_topitem_for_hidden_categories(topitem);
-	if(xlog_hook(5, item))
+	int force_trigger = is_xmbctrl_trigger(item->text) && !xmbctrl_triggered;
+	if(force_trigger) xmbctrl_triggered = 1;
+	if(force_trigger || xlog_hook(5, item))
 		AddVshItem(a0, topitem, item);
 
 	return 0;
@@ -719,7 +807,9 @@ int AddVshItemPatchedGameSavedataMs(void *a0, int topitem, SceVshItem *item)
 int AddVshItemPatchedGameSavedataEf(void *a0, int topitem, SceVshItem *item)
 {
 	topitem = adjust_topitem_for_hidden_categories(topitem);
-	if(xlog_hook(6, item))
+	int force_trigger = is_xmbctrl_trigger(item->text) && !xmbctrl_triggered;
+	if(force_trigger) xmbctrl_triggered = 1;
+	if(force_trigger || xlog_hook(6, item))
 		AddVshItem(a0, topitem, item);
 
 	return 0;
@@ -727,7 +817,16 @@ int AddVshItemPatchedGameSavedataEf(void *a0, int topitem, SceVshItem *item)
 
 void PatchVshMain(u32 text_addr)
 {
-	AddVshItem = (void *)text_addr + patch[0];
+	/* Capture whatever the patch[1] JAL currently points at -- the real
+	   AddVshItem on stock firmware, or xmbctrl's wrapper on ARK-5/ARK-4
+	   (because OnModuleStart has already chained to `previous` before us,
+	   so xmbctrl has finished patching). All our wrappers call this
+	   pointer, so xmbctrl's CFW item injection stays in the chain. */
+	{
+		u32 site = text_addr + patch[1];
+		u32 jal  = _lw(site);
+		AddVshItem = (void *)(((jal & 0x03FFFFFF) << 2) | (site & 0xF0000000));
+	}
 
 	xlog("PatchVshMain: text=0x%08X AddVshItem=0x%08X\n", text_addr, (u32)AddVshItem);
 	xlog("  patch[0]=0x%X first4@AddVshItem=0x%08X\n", patch[0], *(u32 *)AddVshItem);
@@ -739,6 +838,20 @@ void PatchVshMain(u32 text_addr)
 			xlog("  patch[%d]=0x%X site=0x%08X pre=0x%08X (op=0x%02X)\n",
 				i, patch[i], addr, pre, (pre >> 26) & 0x3F);
 		}
+	}
+
+	/* Prologue-patch the real AddVshItem (Layer 2). Filters xmbctrl's
+	   forwarded trigger item so even the first trigger is hideable. */
+	xmbctrl_triggered = 0;
+	{
+		u32 real_addvsh = text_addr + patch[0];
+		add_vsh_trampoline[0] = _lw(real_addvsh);
+		add_vsh_trampoline[1] = _lw(real_addvsh + 4);
+		add_vsh_trampoline[2] = 0x08000000 | (((real_addvsh + 8) >> 2) & 0x03FFFFFF);
+		add_vsh_trampoline[3] = 0;
+
+		_sw(0x08000000 | (((u32)AddVshItemFilter >> 2) & 0x03FFFFFF), real_addvsh);
+		_sw(0, real_addvsh + 4);
 	}
 
 	/* Permanently items */
@@ -791,14 +904,11 @@ void PatchVshMain(u32 text_addr)
 	}
 	else
 	{
-		/* Hide UMD Update Icon (from UVMR by TN) */
-		int umdIoOpenPatched(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode)
-		{
-			return (strcmp(file, "/PSP_GAME/SYSDIR/UPDATE/PARAM.SFO") == 0 && 
-			(cfg(game_category, "UMD_UPDATE") || 
-			cfg(global_category, "HIDE_ALL") || set[4])) ? -1 : umdIoOpen(arg, file, flags, mode);;
-		}
-			
+		/* Hide UMD Update Icon (from UVMR by TN).
+		   umdIoOpenPatched is defined at file scope (see top of file); the
+		   original nested-function form crashed on modern psp-gcc because
+		   the function pointer was a stack-resident trampoline that the
+		   isofs driver kept calling after PatchVshMain's frame went away. */
 		PspIoDrv* umddrv = sctrlHENFindDriver("isofs");
 		umdIoOpen = umddrv->funcs->IoOpen;
 		umddrv->funcs->IoOpen = umdIoOpenPatched;
@@ -811,6 +921,15 @@ void PatchVshMain(u32 text_addr)
 
 int OnModuleStart(SceModule2 *mod)
 {
+	/* Chain to `previous` FIRST. ARK-5's xmbctrl registers later than
+	   us (it's loaded by VSHControl's StartModuleHandler right as
+	   vsh_module is starting), so without this our PatchVshMain would
+	   run before xmbctrl had hooked the JAL sites and our captured
+	   `next` pointers would be the original AddVshItem rather than
+	   xmbctrl's wrapper -- the CFW menu injection would still get
+	   skipped. */
+	int ret = previous ? previous(mod) : 0;
+
 	char *modname = mod->modname;
 	u32 text_addr = mod->text_addr;
 
@@ -820,7 +939,7 @@ int OnModuleStart(SceModule2 *mod)
 		PatchVshMain(text_addr);
 	}
 
-	return previous ? previous(mod) : 0;
+	return ret;
 }
 
 int module_start(SceSize args, void *argp)
