@@ -203,19 +203,97 @@ static u32 add_vsh_trampoline[4] __attribute__((section(".data"), aligned(4))) =
 
 int skip(SceVshItem *item, int location);  /* forward decl, defined further down */
 
+/* MOVE_EXTRAS_ITEMS: relocate ARK's CFW menu items out of Extras, then hide
+   the (now-emptied) Extras category. Custom Launcher -> bottom of Game; CFW
+   Settings + Plugins Manager -> end of Settings. (Custom App / 1.50 Reboot,
+   if present, follow Custom Launcher into Game.) The items are self-contained
+   -- ARK builds each as a malloc'd SceVshItem with its own action/action_arg
+   and a NULL context, dispatched by action_arg regardless of column -- so a
+   shallow memcpy can be re-added to any column just by changing the topitem.
+   On ARK, xmbctrl injects them by calling the real AddVshItem directly, so we
+   intercept them in AddVshItemFilter (the real-AddVshItem hook), not in the
+   call-site wrappers. The shared scene container (reloc_a0) is the a0 they
+   arrived with; topitem alone selects the destination column. */
+static int relocate_extras_flag = 0;
+#define RELOC_MAX 5
+static SceVshItem reloc_items[RELOC_MAX];
+static int reloc_to_settings[RELOC_MAX];   /* 1 = Settings column, 0 = Game */
+static volatile int reloc_count = 0;
+static volatile void *reloc_a0 = 0;
+
+static int adjust_topitem_for_hidden_categories(int topitem);  /* defined below */
+static int is_ark_custom_item(const char *text);                    /* defined below */
+static void capture_relocated_ark_item(void *a0, SceVshItem *item); /* defined below */
+/* Set while the worker thread re-adds the deferred items, so the real-AddVshItem
+   hook (AddVshItemFilter) lets them pass through instead of re-capturing them. */
+static volatile int relocate_reinjecting = 0;
+
+/* Overwrite an item's 3 icon-layer keys (base/shadow/glow). The XMB icon atlas
+   is per-column, so a relocated item must use a key that exists in its NEW
+   column's atlas or it renders as a wrong/placeholder icon. Keys are 2 chars,
+   null-padded to 4. */
+static void reloc_set_icon(SceVshItem *item, const char *img,
+			   const char *sh, const char *gl)
+{
+	item->image[0] = img[0]; item->image[1] = img[1];
+	item->image[2] = 0;      item->image[3] = 0;
+	item->image_shadow[0] = sh[0]; item->image_shadow[1] = sh[1];
+	item->image_shadow[2] = 0;     item->image_shadow[3] = 0;
+	item->image_glow[0] = gl[0]; item->image_glow[1] = gl[1];
+	item->image_glow[2] = 0;     item->image_glow[3] = 0;
+}
+
 int AddVshItemFilter(void *a0, int topitem, SceVshItem *item)
 {
+	int (*trampoline)(void *, int, SceVshItem *) =
+		(int(*)(void *, int, SceVshItem *))add_vsh_trampoline;
+
+	/* This is the hook on the REAL AddVshItem (prologue patch at patch[0]).
+	   Unlike the call-site wrappers, it sees xmbctrl's *direct* CFW item
+	   injections -- xmbctrl builds CFW Settings / Plugins / Custom Launcher
+	   and calls the real AddVshItem itself, bypassing our call-site hooks. So
+	   this is the only place we can intercept those items individually. */
+
+	/* MOVE_EXTRAS_ITEMS: split the CFW items into their new homes. CFW Settings
+	   + Plugins go to the end of Settings now (Settings is already fully walked
+	   by the time xmbctrl injects, so a direct add lands at the end). Custom
+	   Launcher (and Custom App / 1.50 Reboot) are deferred to the worker thread
+	   so they land at the BOTTOM of Game (which hasn't been walked yet here).
+	   relocate_reinjecting guards the thread's own re-adds from re-entering. */
+	if (relocate_extras_flag && is_ark_custom_item(item->text) && !relocate_reinjecting) {
+		if (!strcmp(item->text, "xmbmsgtop_sysconf_configuration") ||
+		    !strcmp(item->text, "xmbmsgtop_sysconf_plugins")) {
+			/* Settings is already fully walked by injection time, so a direct
+			   add lands at the END of Settings. The CFW items carry Network-
+			   column icon keys (FU/FV, from ARK's PSN-item templates) that
+			   don't resolve in the Settings column, so repoint them to
+			   Settings-column keys: CFW Settings -> System gear (BX/CL/CZ),
+			   Plugins -> Theme (BY/CM/DA). */
+			int settings_idx = adjust_topitem_for_hidden_categories(0);
+			if (!strcmp(item->text, "xmbmsgtop_sysconf_configuration"))
+				reloc_set_icon(item, "BX", "CL", "CZ");   /* System Settings */
+			else
+				reloc_set_icon(item, "BY", "CM", "DA");   /* Theme Settings */
+			return trampoline(a0, settings_idx, item);
+		}
+		/* Custom Launcher (and Custom App / 1.50 Reboot): defer to the worker
+		   thread, which re-adds it AFTER the cursor is placed. Adding it during
+		   the walk would make it the first Game item and steal the cursor from
+		   Memory Stick when START_AT_MEMORY_STICK is on. The thread's own re-add
+		   sets relocate_reinjecting, so it falls through this block and is
+		   added normally at the topitem the thread passes. */
+		capture_relocated_ark_item(a0, item);
+		return 0;
+	}
+
 	/* Items reaching us here either came from xmbctrl forwarding (the
 	   trigger item, or its CFW item insertions) or any other caller of
 	   the real AddVshItem. Apply the user's hide rules and forward via
 	   the trampoline if allowed. Location 0 is the default; the
 	   trigger items and CFW item names don't depend on location, so
 	   that's fine. */
-	if(skip(item, 0)) {
-		int (*trampoline)(void *, int, SceVshItem *) =
-			(int(*)(void *, int, SceVshItem *))add_vsh_trampoline;
+	if(skip(item, 0))
 		return trampoline(a0, topitem, item);
-	}
 	return 0;
 }
 u32 topcat_count_patch;
@@ -298,6 +376,30 @@ static int start_at_ms_thread(SceSize args, void *argp)
 	   filter via the prologue patch; boot_hide_for_ms is now clear so they
 	   pass through and get added.) */
 	boot_hide_for_ms = 0;
+
+	/* MOVE_EXTRAS_ITEMS: re-add the relocated Custom Launcher FIRST -- before
+	   the START_AT_MEMORY_STICK items below -- so it lands ahead of Game Sharing
+	   at the TOP of Game. (Item position tracks insertion order relative to the
+	   fixed Game items: adding it after gamedl/savedata dropped it into the
+	   middle, so we add it first.) Still deferred to here, after the cursor is
+	   placed, so the cursor stays on Memory Stick. Only Game-bound items are in
+	   reloc_items (CFW Settings/Plugins were added to Settings synchronously in
+	   AddVshItemFilter); settings_idx remains for safety/symmetry. */
+	if (relocate_extras_flag && reloc_a0) {
+		int game_idx = adjust_topitem_for_hidden_categories(5);
+		int settings_idx = adjust_topitem_for_hidden_categories(0);
+		int i;
+		relocate_reinjecting = 1;   /* so AddVshItemFilter passes these through */
+		for (i = 0; i < reloc_count; i++) {
+			int dest = reloc_to_settings[i] ? settings_idx : game_idx;
+			AddVshItem((void *)reloc_a0, dest, &reloc_items[i]);
+		}
+		relocate_reinjecting = 0;
+	}
+
+	/* Then re-add the START_AT_MEMORY_STICK items (Game Sharing / Saved Data /
+	   UMD); they slot into their canonical Game positions just after the
+	   launcher, giving: Custom Launcher, Game Sharing, Saved Data, UMD, MS. */
 	if (game_ctx_captured) {
 		if (umd_captured)
 			AddVshItem((void *)game_a0, game_topitem, &captured_umd);
@@ -681,7 +783,7 @@ int skip(SceVshItem *item, int location)
 	   from vshmain's runtime context -- the same context the (working)
 	   scene-dump thread was created from. Creating it from OnModuleStart
 	   (much earlier) produced a thread that never ran. */
-	if (start_at_ms_flag && !ms_thread_started) {
+	if ((start_at_ms_flag || relocate_extras_flag) && !ms_thread_started) {
 		SceUID tid;
 		ms_thread_started = 1;
 		tid = sceKernelCreateThread("xmbih_show_savedata",
@@ -814,6 +916,36 @@ static int is_ark_custom_item(const char *text)
 		!strcmp(text, "xmbmsgtop_150_reboot");
 }
 
+/* MOVE_EXTRAS_ITEMS: capture an ARK CFW item as it's injected during boot and
+   tag its destination column, so the worker thread can re-add it later. CFW
+   Settings + Plugins Manager go to Settings; everything else (Custom Launcher
+   and, if present, Custom App / 1.50 Reboot) goes to Game. Dedup by text in
+   case the prologue patch sees the same item more than once. */
+static int reloc_already_captured(const char *text)
+{
+	int i;
+
+	for (i = 0; i < reloc_count; i++)
+		if (!strcmp(reloc_items[i].text, text))
+			return 1;
+
+	return 0;
+}
+
+static void capture_relocated_ark_item(void *a0, SceVshItem *item)
+{
+	if (reloc_count >= RELOC_MAX || reloc_already_captured(item->text))
+		return;
+
+	memcpy(&reloc_items[reloc_count], item, sizeof(SceVshItem));
+	reloc_to_settings[reloc_count] =
+		!strcmp(item->text, "xmbmsgtop_sysconf_configuration") ||
+		!strcmp(item->text, "xmbmsgtop_sysconf_plugins");
+	if (!reloc_a0)
+		reloc_a0 = a0;
+	reloc_count++;
+}
+
 static int is_game_resume_item(const char *text)
 {
 	return !strcmp(text, "msg_game_hibernation");
@@ -872,6 +1004,11 @@ static int is_xmbctrl_trigger(const char *text)
 int AddVshItemPatched(void *a0, int topitem, SceVshItem *item)
 {
 	if (is_ark_custom_item(item->text)) {
+		/* NOTE: on ARK, the CFW items are injected by xmbctrl calling the real
+		   AddVshItem directly, so they DON'T reach this call-site wrapper -- the
+		   MOVE_EXTRAS_ITEMS redirect happens in AddVshItemFilter instead. This
+		   branch only runs if an ARK item ever arrives via a call site (it
+		   doesn't in practice); keep the original remap as a safe fallback. */
 		int original_topitem = topitem;
 		int mapped_topitem = topitem;
 
@@ -1159,11 +1296,22 @@ int module_start(SceSize args, void *argp)
 	set[56] = cfg(global_category, "HIDE_ALL_VIDEO");
 	set[54] = cfg(global_category, "HIDE_ALL");
 	set[55] = cfg(global_category, "USE_PLUGIN");
+	relocate_extras_flag = cfg(global_category, "MOVE_EXTRAS_ITEMS");
+	if (relocate_extras_flag)
+		set[1] = 2;   /* hide the now-empty Extras category. This shifts Game's
+		                 displayed index left; a patched category_lite stays in
+		                 sync by reading MOVE_EXTRAS_ITEMS from xmbih.ini and
+		                 counting Extras in its own Game-topitem calculation. */
+
 	start_at_ms_flag = cfg(global_category, "START_AT_MEMORY_STICK");
-	if (start_at_ms_flag) {
+	if (start_at_ms_flag)
 		boot_hide_for_ms = 1;
-		/* Game's displayed index = 5 minus any hidden pre-Game categories,
-		   so the XMB-ready signal matches regardless of what's hidden. */
+
+	if (start_at_ms_flag || relocate_extras_flag) {
+		/* The worker thread's XMB-ready signal = Game's displayed index = 5
+		   minus any hidden pre-Game categories, so it matches regardless of
+		   what's hidden. Computed after set[1] is finalized above, so hiding
+		   Extras for MOVE_EXTRAS_ITEMS is accounted for. */
 		start_ms_game_index = adjust_topitem_for_hidden_categories(5);
 	}
 

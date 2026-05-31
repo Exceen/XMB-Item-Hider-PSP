@@ -26,6 +26,15 @@ Set `START_AT_MEMORY_STICK = 1` under `[Global]` in the `.ini` to make the XMB b
 
 It briefly hides those items (and the UMD disc, if inserted) during boot so the cursor settles on Memory Stick, then re-adds them automatically once the XMB has finished loading — so everything stays accessible. The re-add is tied to a detected "XMB ready" signal (no fixed delay).
 
+#### <ins>Move Extras items (ARK only):</ins>
+Set `MOVE_EXTRAS_ITEMS = 1` under `[Global]` in the `.ini` to relocate ARK's CFW menu items out of the `Extras` category and then hide `Extras`:
+- **Custom Launcher** → top of the `Game` category (before `Game Sharing`)
+- **CFW Settings** + **Plugins Manager** → end of the `Settings` category
+
+The items are captured as ARK injects them during boot and re-added to their new homes once the XMB has finished loading (same "XMB ready" signal as above), so they keep working — selecting them is unaffected. The cursor still starts on `Memory Stick` when combined with `START_AT_MEMORY_STICK`. Because the items inherit ARK's PlayStation®Network icon keys (which don't render outside that column), the relocated `Settings` items are given stock `Settings` icons (System gear / Theme).
+
+> **Using [Game Categories Lite](https://github.com/Exceen/game-categories-lite)?** Hiding `Extras` shifts the `Game` column's index, which Game Categories Lite must account for or it stops finding `Game`. Use a build of Game Categories Lite that recognizes `MOVE_EXTRAS_ITEMS=1` in `xmbih.ini` (it reads the shift from there). Deploy both plugins together.
+
 #### <ins>Known Limitations:</ins>
 - You can't completely hide the leftmost `Settings` category with `HIDE_ALL_SETTINGS = 2` in the `.ini` file--only its contents (`HIDE_ALL_SETTINGS = 1`). (The `Settings` category seems to act as the "anchor" for the rest of the categories.)
   - `Settings` *does* get hidden with `HIDE_ALL = 2`.
