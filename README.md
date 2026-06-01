@@ -25,7 +25,7 @@ Tested on:
 - You can't completely hide the leftmost `Settings` category with `HIDE_ALL_SETTINGS = 2` in the `.ini` file--only its contents (`HIDE_ALL_SETTINGS = 1`). (The `Settings` category seems to act as the "anchor" for the rest of the categories.)
   - `Settings` *does* get hidden with `HIDE_ALL = 2`.
 - Completely hiding any category to the left of the `Game` category can cause buggy behavior with `Game` menu items. (i.e., Duplicated `Memory Stick` entries; Deleted `Resume Game` entries don't properly disappear until the next full VSH reset.)
-  - Completely hiding the "Extras" category adds additional bugs. If you want to hide "Extras", there is already a safe CFW way to do so: Just change your VSH region to one of the following in your CFW settings:
+  - Completely hiding the "Extras" category via the plugin adds additional bugs. If you want to hide "Extras", there is already a safe CFW way to do so: Just change your VSH region to one of the following in your CFW settings:
 <br>`Latin America` `Hong Kong` `Taiwan` `Russia` `China` `Debug I`
 <br><br><table>
 <tr>
