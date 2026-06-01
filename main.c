@@ -31,6 +31,7 @@
 #include <pspsdk.h>
 #include <pspkernel.h>
 #include <systemctrl.h>
+#include <systemctrl_se.h>
 #include <main.h>
 #include <kubridge.h>
 #include <string.h>
@@ -450,6 +451,72 @@ static XmbTopCategory *find_top_category_table(u32 text_addr)
 	return NULL;
 }
 
+/*
+ * HIDE_ALL_EXTRAS modes:
+ *   2 = hide Extras; relocate ARK's CFW items to Game (wad's behavior)
+ *   3 = hide Extras; SPLIT ARK's CFW items -- Custom Launcher -> Game,
+ *       Custom Firmware Settings + Plugins -> end of PSP Settings
+ *
+ * On a fake VSH region that already drops Extras (Russia/China), ARK itself
+ * moves the CFW items to Game and the category list keeps its full layout, so
+ * XMBIH must NOT also count-patch Extras (that would double-hide and desync the
+ * Game-item paths). We detect the region and route the split purely by item
+ * name, independent of how Extras came to be hidden.
+ */
+#define FAKE_REGION_RUSSIA       10
+#define FAKE_REGION_CHINA        11
+#define FAKE_REGION_DEBUG_TYPE_I 12
+#define SE_CONFIG_EX_NID     0x8E426F09
+
+typedef SEConfig *(*GetSEConfigExFunc)(SEConfig *config, int size);
+
+static int fake_region_loaded = 0;
+static int fake_region_hides_extras = 0;
+
+static int fake_region_value_hides_extras(int vshregion)
+{
+	/* Regions known to drop the Extras column (kept in sync with
+	   game-categories-lite). wad also lists Latin America / Hong Kong / Taiwan;
+	   add them here + in cat_lite if needed. */
+	return vshregion == FAKE_REGION_RUSSIA ||
+	       vshregion == FAKE_REGION_CHINA ||
+	       vshregion == FAKE_REGION_DEBUG_TYPE_I;
+}
+
+static int extras_hidden_by_region(void)
+{
+	if (!fake_region_loaded) {
+		GetSEConfigExFunc get_se_config_ex;
+
+		fake_region_loaded = 1;
+		get_se_config_ex = (GetSEConfigExFunc)sctrlHENFindFunction(
+			"SystemCtrlForUser", "SystemCtrlForUser", SE_CONFIG_EX_NID);
+		if (get_se_config_ex) {
+			SEConfig se_config;
+			memset(&se_config, 0, sizeof(se_config));
+			if (get_se_config_ex(&se_config, sizeof(se_config)))
+				fake_region_hides_extras =
+					fake_region_value_hides_extras(se_config.vshregion);
+		}
+	}
+
+	return fake_region_hides_extras;
+}
+
+/* set[1]==3: the split relocation mode. */
+static int extras_split_mode(void)
+{
+	return set[1] == 3;
+}
+
+/* Extras column is gone this boot -- either =2's count-patch hides it, or the
+   active fake VSH region does. (=3 does NOT hide it itself; it relies on the
+   region, so it isn't listed here.) Used to decide where ARK items land. */
+static int extras_is_hidden(void)
+{
+	return set[1] == 2 || extras_hidden_by_region();
+}
+
 static int top_category_requested_hidden(int index)
 {
 	if (set[54] == 2) {
@@ -470,7 +537,13 @@ static int top_category_requested_hidden(int index)
 
 	switch (index) {
 		case 1:
-			return set[1] == 2;
+			/* Only =2 hides the Extras column via the count-patch (and only
+			   when a fake region isn't already hiding it). =3 NEVER count-
+			   patches: it relies on a fake VSH region (Russia/China) to drop
+			   Extras at build time, and only relocates the CFW items. This is
+			   what keeps =3 resume-safe -- the count-patch (any pre-Game
+			   category hide) is what breaks resume from sleep. */
+			return (set[1] == 2) && !extras_hidden_by_region();
 		case 2:
 			return set[2] == 2;
 		case 3:
@@ -873,20 +946,48 @@ static int is_game_resume_item(const char *text)
 	return !strcmp(text, "msg_game_hibernation");
 }
 
-static int remap_ark_topitem(int incoming_topitem, int *out_topitem);
+static int remap_ark_topitem(const char *text, int incoming_topitem, int *out_topitem);
+static int is_settings_bound_ark_item(const char *text);
+
+/* Rewrite the 3 XMB icon-layer keys. They resolve against a per-column atlas,
+   so an item moved to a new column needs keys that exist there. */
+static void reloc_set_icon(SceVshItem *item, const char *img, const char *sh,
+	const char *gl)
+{
+	strcpy(item->image, img);
+	strcpy(item->image_shadow, sh);
+	strcpy(item->image_glow, gl);
+}
+
+/* =3 moves CFW Settings + Plugins into the Settings column, whose atlas differs
+   from the Network/PSN one ARK's templates use -- repoint to Settings keys so
+   they don't render as garbage. (System gear / Theme; derived on 6.61.) */
+static void reloc_fix_settings_icon(SceVshItem *item)
+{
+	if (!strcmp(item->text, "xmbmsgtop_sysconf_configuration"))
+		reloc_set_icon(item, "BX", "CL", "CZ");
+	else if (!strcmp(item->text, "xmbmsgtop_sysconf_plugins"))
+		reloc_set_icon(item, "BY", "CM", "DA");
+}
 
 static int prepare_topitem_for_item(SceVshItem *item, int incoming_topitem,
 	int *out_topitem, const char *source)
 {
 	if (is_ark_custom_item(item->text)) {
-		if (!remap_ark_topitem(incoming_topitem, out_topitem)) {
+		if (!remap_ark_topitem(item->text, incoming_topitem, out_topitem)) {
 			xlog("%s ark item: text='%s' topitem=%d dropped\n",
 				source, item->text, incoming_topitem);
 			return 0;
 		}
 
-		xlog("%s ark item: text='%s' topitem=%d adjusted=%d\n",
-			source, item->text, incoming_topitem, *out_topitem);
+		/* In split mode the two settings-bound items changed columns, so fix
+		   their icon keys for the Settings atlas. */
+		if (extras_split_mode() && is_settings_bound_ark_item(item->text))
+			reloc_fix_settings_icon(item);
+
+		xlog("%s ark item: text='%s' topitem=%d adjusted=%d split=%d\n",
+			source, item->text, incoming_topitem, *out_topitem,
+			extras_split_mode());
 		return 1;
 	}
 
@@ -900,26 +1001,40 @@ static int prepare_topitem_for_item(SceVshItem *item, int incoming_topitem,
 	return 1;
 }
 
-static int remap_ark_topitem(int incoming_topitem, int *out_topitem)
+/* The two "settings-like" CFW items that =3 sends to PSP Settings. */
+static int is_settings_bound_ark_item(const char *text)
+{
+	return !strcmp(text, "xmbmsgtop_sysconf_configuration") ||
+	       !strcmp(text, "xmbmsgtop_sysconf_plugins");
+}
+
+static int remap_ark_topitem(const char *text, int incoming_topitem, int *out_topitem)
 {
 	/*
-	 * Keep ARK's behavior constrained to its intended homes:
-	 * - Extras, when ARK is injecting through the Extras path and Extras is visible
-	 * - Game, when Extras is hidden and Game is visible
-	 * - nothing, when neither destination is visible
+	 * Decide where an ARK CFW item lands. Routing is by item NAME and is
+	 * checked in priority order so it works regardless of HOW (or whether)
+	 * Extras is hidden -- which matters for the Russia workaround, where the
+	 * region hides Extras and ARK injects the items into Game (topitem 5):
+	 *
+	 *  1. =3 split: CFW Settings + Plugins  -> PSP Settings (always)
+	 *  2. Extras still visible + Extras-path injection -> keep in Extras
+	 *  3. otherwise (Launcher/app/reboot, or Extras hidden) -> Game
+	 *  4. destination category not visible -> drop
+	 *
+	 * Note: =3 never count-patches, so it never hides Extras itself; under a
+	 * fake region the region does it, and this just relocates the two items.
 	 */
-	if (incoming_topitem == 1) {
-		if (!hide_top_category(1)) {
-			*out_topitem = adjust_topitem_for_hidden_categories(incoming_topitem);
+	if (extras_split_mode() && is_settings_bound_ark_item(text)) {
+		if (!hide_top_category(0)) {
+			*out_topitem = adjust_topitem_for_hidden_categories(0);
 			return 1;
 		}
+		/* Settings column hidden too -> fall through to Game. */
+	}
 
-		if (!hide_top_category(5)) {
-			*out_topitem = adjust_topitem_for_hidden_categories(5);
-			return 1;
-		}
-
-		return 0;
+	if (!extras_is_hidden() && incoming_topitem == 1) {
+		*out_topitem = adjust_topitem_for_hidden_categories(1);
+		return 1;
 	}
 
 	if (!hide_top_category(5)) {

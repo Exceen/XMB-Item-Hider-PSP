@@ -28,6 +28,14 @@ It briefly hides those items (and the UMD disc, if inserted) during boot so the 
 
 While `START_AT_MEMORY_STICK` is enabled it also **force-hides the "UMD Update" item** (the same effect as `UMD_UPDATE = 1`). This is required: booting / resetting the VSH with that item present and a UMD inserted crashes the XMB.
 
+#### <ins>Relocating the "Extras" CFW items (`HIDE_ALL_EXTRAS`):</ins>
+On ARK CFW the `Extras` category holds three injected items — **Custom Firmware Settings**, **Plugins Manager**, and **Custom Launcher**. `HIDE_ALL_EXTRAS` can hide `Extras` while keeping those items reachable:
+
+- **`HIDE_ALL_EXTRAS = 2`** — hide `Extras` and move all three items into `Game`.
+- **`HIDE_ALL_EXTRAS = 3`** — hide `Extras` and **split** them: **Custom Launcher → `Game`**, **Custom Firmware Settings + Plugins Manager → end of `Settings`** (repointed to Settings-column icons).
+
+`= 3` never shifts the category count, so it relies on a **fake VSH region that drops the `Extras` column** (Russia, China, or Debug I — set in CFW Settings) to actually hide it — which keeps it **resume-safe** and avoids the pre-Game-hide bugs below. Without such a region active, `= 3` only relocates the items and leaves `Extras` visible.
+
 #### <ins>Known Limitations:</ins>
 - You can't completely hide the leftmost `Settings` category with `HIDE_ALL_SETTINGS = 2` in the `.ini` file--only its contents (`HIDE_ALL_SETTINGS = 1`). (The `Settings` category seems to act as the "anchor" for the rest of the categories.)
   - `Settings` *does* get hidden with `HIDE_ALL = 2`.
