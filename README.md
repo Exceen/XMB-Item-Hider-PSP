@@ -30,7 +30,7 @@ Tested on:
 <br><br><table>
 <tr>
   <td colspan="3">
-    <div align="center"><h4><ins><b>Known bugs when completely hiding Categories left of the "Game" category</b></ins></h4></div>
+    <div align="center"><h4><ins><b>Known bugs when completely hiding categories left of the "Game" category</b></ins></h4></div>
   </td>
 </tr>
 <tr>
