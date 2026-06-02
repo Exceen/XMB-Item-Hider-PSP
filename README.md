@@ -31,10 +31,10 @@ On ARK CFW, the `Extras` category holds three injected items: **Custom Firmware 
 
 - **`MOVE_ARK_EXTRAS = 1`** — Move **Custom Launcher → `Game`**, and **Custom Firmware Settings & Plugins Manager → end of `Settings`** (with updated Settings-column icons)!<br><img width="480" height="272" alt="Image" src="https://github.com/user-attachments/assets/1438e70e-cdcd-49c9-bf82-8bb1e8e2e983" />
 - **`HIDE_ALL_EXTRAS = 2`** — Mimics ARK CFW when the `Extras` category is absent: Hide `Extras` completely, and move all three ARK items into `Game`.
-  - Introduces bugs, so Fake VSH Region should be used to hide `Extras` instead--see **Known Limitations** below.
+  - Introduces bugs, so Fake VSH Region should be used to hide `Extras` instead—see **Known Limitations** below.
 
 ## Known Limitations:
-- You can't completely hide the leftmost `Settings` category with `HIDE_ALL_SETTINGS = 2` in the `xmbih.ini` file--only its contents (`HIDE_ALL_SETTINGS = 1`). (The `Settings` category seems to act as the "anchor" for the rest of the categories.)
+- You can't completely hide the leftmost `Settings` category with `HIDE_ALL_SETTINGS = 2` in the `xmbih.ini` file—only its contents (`HIDE_ALL_SETTINGS = 1`). (The `Settings` category seems to act as the "anchor" for the rest of the categories.)
   - `Settings` *does* get hidden with `HIDE_ALL = 2`.
 - Completely hiding any category to the left of the `Game` category can cause buggy behavior with `Game` menu items. (i.e., Duplicated `Memory Stick` entries; Deleted `Resume Game` entries don't properly disappear until the next full VSH reset.)
   - Completely hiding the `Extras` category via the plugin adds additional bugs. If you want to hide `Extras`, there is already a safe CFW way to do so: Just change your VSH region to one of the following in your CFW settings:
