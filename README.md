@@ -45,7 +45,8 @@ On ARK CFW the `Extras` category holds three injected items — **Custom Firmwar
 <br><br><table>
 <tr>
   <td colspan="3">
-    <div align="center"><h4><ins><b>Known bugs when completely hiding categories left of the "Game" category</b></ins></h4></div>
+    <div align="center"><h4><ins><b>Known bugs when completely hiding categories left of the "Game" category</b></ins></h4>
+    </div>
   </td>
 </tr>
 <tr>
@@ -59,6 +60,11 @@ On ARK CFW the `Extras` category holds three injected items — **Custom Firmwar
   <td><a href="https://github.com/wad11656/XMB-Item-Hider-PSP/tree/Shift-UMD-entries">🔍 Investigating</a></td>
 </tr>
 <tr>
+  <td><i>(Non-PSP Go)</i> Crash when waking from sleep</td>
+  <td>https://youtu.be/cDNEmgeg8wE</td>
+  <td><div align="center">➖</div></td>
+</tr>
+<tr>
   <td><i>(PSP Go)</i> Deleting "Resume Game"<br>doesn't apply until VSH reset</td>
   <td>https://youtu.be/A1_ZhReEZRM</td>
   <td><div align="center">➖</div></td>
@@ -67,7 +73,7 @@ On ARK CFW the `Extras` category holds three injected items — **Custom Firmwar
   <td colspan="3"><div align="center"><ins>"Memory Stick" entries get duplicated</ins>
 </tr>
 <tr>
-  <td><ins>After sleep+wake:</ins>
+  <td><i>(PSP Go)</i> <ins>After sleep+wake:</ins>
   <br>
     <ul>
       <li>Game > "Memory Stick" duplicates.</li>
