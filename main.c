@@ -43,7 +43,7 @@ PSP_MODULE_INFO("XMBIH", 0x0007, 1, 3);
 
 static struct {
 	volatile unsigned char guard[0x200];
-	volatile unsigned char flags[58];
+	volatile unsigned char flags[59];
 } cfg_store;
 
 #define set cfg_store.flags
@@ -173,20 +173,22 @@ int (* umdIoOpen)(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode);
    preview is loaded and isofs calls into us. As a top-level function it
    captures nothing from PatchVshMain (it only references globals), so the
    lift is behaviourally identical except it doesn't crash. */
-extern char *game_category;     /* defined further down */
-extern char *global_category;
-extern int   cfg(char *category, char *fmt);
+static int start_at_ms_flag;    /* defined further down (START_AT_MEMORY_STICK) */
 static int umdIoOpenPatched(PspIoDrvFileArg* arg, char* file, int flags, SceMode mode)
 {
 	/* START_AT_MEMORY_STICK force-hides the UMD Update item: with it enabled,
 	   booting (or resetting the VSH) with a UMD inserted while that item is
 	   present crashes the XMB, so we block its PARAM.SFO unconditionally here
-	   the same way UMD_UPDATE=1 does. */
+	   the same way UMD_UPDATE=1 does.
+
+	   All flags are read from the cache parsed at module_start (set[58]=
+	   UMD_UPDATE, set[54]=HIDE_ALL, start_at_ms_flag=START_AT_MEMORY_STICK,
+	   set[4]=HIDE_ALL_GAME). We deliberately do NOT call cfg() here: this runs
+	   inside isofs's IoOpen hook, and re-opening/parsing the ini off the
+	   memory stick from within the storage driver path is needless work (the
+	   flags are static for the boot) and best avoided in that context. */
 	return (strcmp(file, "/PSP_GAME/SYSDIR/UPDATE/PARAM.SFO") == 0 &&
-	        (cfg(game_category, "UMD_UPDATE") ||
-	         cfg(global_category, "HIDE_ALL") ||
-	         cfg(global_category, "START_AT_MEMORY_STICK") ||
-	         set[4]))
+	        (set[58] || set[54] || start_at_ms_flag || set[4]))
 	       ? -1
 	       : umdIoOpen(arg, file, flags, mode);
 }
@@ -1405,6 +1407,7 @@ int module_start(SceSize args, void *argp)
 	xlog_raw_both("cfg: game 6\n");
 	/* Game */
 	set[35] = cfg(game_category, "GAME_SHARING");
+	set[58] = cfg(game_category, "UMD_UPDATE");
 	set[36] = cfg(game_category, "SAVED_DATA_UTILITY_MS");
 	set[37] = cfg(game_category, "SAVED_DATA_UTILITY_EF");
 	set[38] = cfg(game_category, "RESUME_GAME");
