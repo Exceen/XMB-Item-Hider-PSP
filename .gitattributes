@@ -1,0 +1,7 @@
+# Normalize all text files to LF in the repo and on checkout, so line
+# endings don't drift back to CRLF on Windows checkouts/edits.
+* text=auto eol=lf
+
+# Prebuilt binaries / static libs: never normalize or diff as text.
+*.prx binary
+*.a   binary
